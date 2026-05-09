@@ -1,0 +1,432 @@
+// ======================================================
+// VALIDATOR: HeatDroughtStatic_NH_v1
+// ======================================================
+// Text-heavy output — designed for mobile / no-visual-inspection use.
+// Sections:
+//   A. Band inventory
+//   B. Global value range statistics (per band)
+//   C. Reference site spot checks (7 sites)
+//   D. Logical consistency (backward_sow derivation, range bounds)
+//   E. Sentinel / fallback pixel fractions
+//   F. Latitudinal band statistics
+//   G. Ocean vs land mask sanity check
+//   H. Distribution charts (supplementary)
+//
+// Compatible with single-year test runs and full 30-year runs.
+// For a 1-year run: P20 = the single-year value; expected ranges
+// are calibrated to ±4 composites (~32 days) of typical 1951 values.
+// ======================================================
+
+var ASSET_ID = 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_NH_v1';
+
+// NH parameters (from GDD_static_aggr_heat)
+var AUTUMN_MIN  = 185;  // fallback for heat_open_doy (always-cool pixels)
+var AUTUMN_MAX  = 361;  // fallback for moisture_open_doy (no autumn moisture)
+var SPRING_MAX  = 177;  // fallback for all spring bands (no spring re-warming/drying)
+var BWD_OFFSET  = 215;  // CLOSE_DOY_WRAP_ADD(365) - EXPECTED_SEASON_DAYS(150)
+// backward_sow_irr = heat_close_doy + BWD_OFFSET for all valid pixels
+
+var EXPECTED_BANDS = [
+  'heat_open_doy',       // P20 autumn DOY: sustained Tmax <= 28C (2 composites)
+  'moisture_open_doy',   // P20 autumn DOY: sustained VSW >= 0.22 (2 composites)
+  'heat_close_doy',      // MEAN spring DOY: sustained Tmax >= 28C (raw spring DOY 1-177)
+  'hard_heat_close_doy', // MEAN spring DOY: Tmax >= 35C (single composite)
+  'moisture_close_doy',  // MEAN spring DOY: sustained VSW <= 0.12 (raw spring DOY)
+  'backward_sow_irr'     // DERIVED = heat_close_doy + 215 (rabi-wrapped DOY 216-392)
+];
+
+// ── Load asset ────────────────────────────────────────────────────
+var img = ee.Image(ASSET_ID);
+
+// NH land region for statistics (avoid ocean, polar)
+var nhRegion = ee.Geometry.Polygon(
+  [[[-180, 0], [180, 0], [180, 70], [-180, 70]]], null, false);
+
+print('================================================');
+print('HeatDroughtStatic NH v1 — Validation Report');
+print('Asset: ' + ASSET_ID);
+print('================================================');
+
+// ── A. BAND INVENTORY ─────────────────────────────────────────────
+print('');
+print('── A. BAND INVENTORY ───────────────────────');
+
+img.bandNames().evaluate(function(bnames) {
+  print('Band count: ' + bnames.length + ' (expected ' + EXPECTED_BANDS.length + ')' +
+        (bnames.length === EXPECTED_BANDS.length ? '  PASS' : '  FAIL'));
+  EXPECTED_BANDS.forEach(function(b) {
+    var found = bnames.indexOf(b) >= 0;
+    print('  ' + (found ? '[OK] ' : '[!!] ') + b + (found ? '' : '  MISSING'));
+  });
+  bnames.forEach(function(b) {
+    if (EXPECTED_BANDS.indexOf(b) < 0) print('  [??] ' + b + '  unexpected');
+  });
+});
+
+// ── B. GLOBAL VALUE RANGES ───────────────────────────────────────
+// Note: 0-value pixels are masked via selfMask() — they are ocean/non-crop.
+// Valid autumn bands: [185, 361]
+// Valid spring bands: [1, 177]
+// Valid backward_sow_irr: [216, 392]
+print('');
+print('── B. GLOBAL VALUE RANGES (0-px excluded) ──');
+
+var BAND_BOUNDS = [
+  {b: 'heat_open_doy',       lo: 185, hi: 361, label: 'autumn cooling [185-361]'},
+  {b: 'moisture_open_doy',   lo: 185, hi: 361, label: 'autumn VSW open [185-361]'},
+  {b: 'heat_close_doy',      lo: 1,   hi: 177, label: 'spring warming [1-177]'},
+  {b: 'hard_heat_close_doy', lo: 1,   hi: 177, label: 'spring 35C [1-177]'},
+  {b: 'moisture_close_doy',  lo: 1,   hi: 177, label: 'spring VSW close [1-177]'},
+  {b: 'backward_sow_irr',    lo: 216, hi: 392, label: 'backward sow [216-392]'}
+];
+
+BAND_BOUNDS.forEach(function(bd) {
+  var masked = img.select(bd.b).selfMask();
+  var stats = masked.reduceRegion({
+    reducer: ee.Reducer.min()
+      .combine(ee.Reducer.percentile([5, 25, 50, 75, 95]), null, true)
+      .combine(ee.Reducer.max(), null, true),
+    geometry: nhRegion,
+    scale: 55632,
+    maxPixels: 1e8,
+    bestEffort: true
+  });
+  stats.evaluate(function(s) {
+    var mn  = s[bd.b + '_min']   !== null ? Math.round(s[bd.b + '_min'])   : 'null';
+    var p5  = s[bd.b + '_p5']    !== null ? Math.round(s[bd.b + '_p5'])    : 'null';
+    var p25 = s[bd.b + '_p25']   !== null ? Math.round(s[bd.b + '_p25'])   : 'null';
+    var p50 = s[bd.b + '_p50']   !== null ? Math.round(s[bd.b + '_p50'])   : 'null';
+    var p75 = s[bd.b + '_p75']   !== null ? Math.round(s[bd.b + '_p75'])   : 'null';
+    var p95 = s[bd.b + '_p95']   !== null ? Math.round(s[bd.b + '_p95'])   : 'null';
+    var mx  = s[bd.b + '_max']   !== null ? Math.round(s[bd.b + '_max'])   : 'null';
+    var rangeOK = (typeof mn === 'number' && typeof mx === 'number')
+                  ? (mn >= bd.lo && mx <= bd.hi) : false;
+    print(bd.b + ' [' + bd.label + ']' + (rangeOK ? '  PASS' : '  FAIL'));
+    print('  min=' + mn + '  p5=' + p5 + '  p25=' + p25 + '  p50=' + p50 +
+          '  p75=' + p75 + '  p95=' + p95 + '  max=' + mx);
+  });
+});
+
+// ── C. REFERENCE SITE SPOT CHECKS ────────────────────────────────
+// Expected ranges calibrated to ±4 composites (32 days) of typical values.
+// 1-year run: single-year observations; ranges allow for inter-annual variability.
+// Moisture bands have ±40-day tolerance (higher spatial/temporal variability).
+//
+// Autumn bands:  heat_open and moisture_open = raw autumn DOY 185-361
+// Spring bands:  heat_close and moisture_close = raw SPRING YEAR DOY 1-177
+//   (consumer adds 365 to convert to rabi-wrapped system)
+// backward_sow_irr = heat_close_doy + 215 (pre-computed rabi-wrapped DOY)
+print('');
+print('── C. REFERENCE SITE SPOT CHECKS ──────────');
+print('Tolerance: temp +-32 DOY, moisture +-40 DOY, bwd = heat_close+215');
+
+var SITES = [
+  // Punjab: classic rabi zone, hot summer, cools Sep-Oct, warms Mar-Apr
+  { name: 'Punjab PK',       lon: 73.1,  lat: 31.5,
+    ho: [233, 297], mo: [185, 273], hc: [65, 129], hc35: [97, 177], mc: [1, 145],
+    note: 'hot summer -> late autumn cool; early spring warm'
+  },
+  // Nile Delta: very hot, arid; ultra-early spring warming
+  { name: 'Nile Delta EG',   lon: 31.0,  lat: 30.5,
+    ho: [249, 321], mo: [329, 361], hc: [33, 97],  hc35: [65, 177], mc: [1, 177],
+    note: 'arid -> moisture_open near fallback 361; very early heat_close'
+  },
+  // North China Plain: continental monsoon, cools Sep-Oct, warms Apr-May
+  { name: 'N China Plain',   lon: 116.0, lat: 35.0,
+    ho: [241, 305], mo: [209, 289], hc: [89, 153], hc35: [113, 177], mc: [33, 177],
+    note: 'monsoon wet autumn; later spring warming than Egypt'
+  },
+  // Castile Spain: Mediterranean continental, hot summer, autumn rains
+  { name: 'Castile ES',      lon: -3.5,  lat: 40.0,
+    ho: [209, 281], mo: [249, 337], hc: [113, 169], hc35: [137, 177], mc: [33, 161],
+    note: 'Mediterranean: autumn rains Oct-Nov; spring warming May-Jun'
+  },
+  // Kansas USA: Great Plains, hot summer, variable rainfall
+  { name: 'Kansas USA',      lon: -98.0, lat: 37.5,
+    ho: [209, 281], mo: [185, 337], hc: [97, 169], hc35: [129, 177], mc: [1, 177],
+    note: 'variable rainfall; heat_close Apr-Jun'
+  },
+  // Louisiana: humid subtropical, very hot and humid, late autumn cooling
+  { name: 'Louisiana USA',   lon: -91.5, lat: 30.5,
+    ho: [257, 337], mo: [185, 313], hc: [81, 161], hc35: [113, 177], mc: [1, 177],
+    note: 'extended summer heat -> late heat_open; humid so moisture_open early'
+  },
+  // Loire Valley France: cool maritime, rarely exceeds 28C; near fallback expected
+  { name: 'Loire FR',        lon: 1.0,   lat: 47.0,
+    ho: [185, 249], mo: [185, 249], hc: [137, 177], hc35: [161, 177], mc: [65, 177],
+    note: 'cool maritime -> heat_open near fallback 185; heat_close near fallback 177'
+  }
+];
+
+var sitePts = ee.FeatureCollection(SITES.map(function(s) {
+  return ee.Feature(ee.Geometry.Point([s.lon, s.lat]), {site: s.name});
+}));
+
+img.sampleRegions({
+  collection: sitePts,
+  scale: 11132,
+  geometries: false
+}).evaluate(function(fc) {
+  if (!fc || !fc.features || fc.features.length === 0) {
+    print('ERROR: sampleRegions returned no features — check asset ID and geometry');
+    return;
+  }
+  fc.features.forEach(function(f) {
+    var p    = f.properties;
+    var name = p.site;
+    var site = null;
+    SITES.forEach(function(s) { if (s.name === name) site = s; });
+    if (!site) return;
+
+    var ho  = Math.round(p.heat_open_doy);
+    var mo  = Math.round(p.moisture_open_doy);
+    var hc  = Math.round(p.heat_close_doy);
+    var hhc = Math.round(p.hard_heat_close_doy);
+    var mc  = Math.round(p.moisture_close_doy);
+    var bwd = Math.round(p.backward_sow_irr);
+
+    var hoOK  = ho  >= site.ho[0]  && ho  <= site.ho[1];
+    var moOK  = mo  >= site.mo[0]  && mo  <= site.mo[1];
+    var hcOK  = hc  >= site.hc[0]  && hc  <= site.hc[1];
+    var mcOK  = mc  >= site.mc[0]  && mc  <= site.mc[1];
+    var bwdExpected = hc + BWD_OFFSET;
+    var bwdOK = Math.abs(bwd - bwdExpected) <= 1;
+
+    print('');
+    print(name + ' (' + site.lat + 'N, ' + site.lon + 'E)');
+    print('  [' + site.note + ']');
+    print('  heat_open_doy:       ' + ho  +
+          '  expect [' + site.ho[0]  + '-' + site.ho[1]  + ']' + (hoOK  ? '' : '  FAIL'));
+    print('  moisture_open_doy:   ' + mo  +
+          '  expect [' + site.mo[0]  + '-' + site.mo[1]  + ']' + (moOK  ? '' : '  FAIL'));
+    print('  heat_close_doy:      ' + hc  +
+          '  expect [' + site.hc[0]  + '-' + site.hc[1]  + ']' + (hcOK  ? '' : '  FAIL'));
+    print('  hard_heat_close_doy: ' + hhc +
+          '  expect [' + site.hc35[0] + '-' + site.hc35[1] + '] (informational)');
+    print('  moisture_close_doy:  ' + mc  +
+          '  expect [' + site.mc[0]  + '-' + site.mc[1]  + ']' + (mcOK  ? '' : '  FAIL'));
+    print('  backward_sow_irr:    ' + bwd +
+          '  = heat_close+215 -> expect ' + bwdExpected + (bwdOK ? '  PASS' : '  FAIL'));
+  });
+});
+
+// ── D. LOGICAL CONSISTENCY ────────────────────────────────────────
+print('');
+print('── D. LOGICAL CONSISTENCY ──────────────────');
+
+// D1: backward_sow_irr = heat_close_doy + 215 for all valid (non-zero) pixels
+var validMask = img.select('heat_close_doy').gt(0); // 0 = ocean/masked
+var hcMasked  = img.select('heat_close_doy').updateMask(validMask);
+var bwdMasked = img.select('backward_sow_irr').updateMask(validMask);
+var bwdResidual = bwdMasked.subtract(hcMasked.add(BWD_OFFSET)).abs();
+var bwdMatchFrac = bwdResidual.lte(1).selfMask().reduceRegion({
+  reducer: ee.Reducer.mean().combine(ee.Reducer.count(), null, true),
+  geometry: nhRegion, scale: 55632, maxPixels: 1e8, bestEffort: true
+});
+bwdMatchFrac.evaluate(function(s) {
+  var pct = s['backward_sow_irr_mean'] !== null
+            ? (s['backward_sow_irr_mean'] * 100).toFixed(1) : 'N/A';
+  var n   = s['backward_sow_irr_count'] || 0;
+  print('D1 backward_sow = heat_close + ' + BWD_OFFSET + ':');
+  print('   ' + pct + '% match across ' + n + ' sampled pixels' +
+        (parseFloat(pct) > 99 ? '  PASS' : '  FAIL — check CLOSE_DOY_WRAP_ADD / EXPECTED_SEASON_DAYS'));
+});
+
+// D2: heat_open_doy in [185, 361] for all valid pixels
+var hoMasked = img.select('heat_open_doy').selfMask();
+var hoInRange = hoMasked.gte(AUTUMN_MIN).and(hoMasked.lte(AUTUMN_MAX));
+hoInRange.selfMask().reduceRegion({
+  reducer: ee.Reducer.mean().combine(ee.Reducer.count(), null, true),
+  geometry: nhRegion, scale: 55632, maxPixels: 1e8, bestEffort: true
+}).evaluate(function(s) {
+  var pct = s['heat_open_doy_mean'] !== null
+            ? (s['heat_open_doy_mean'] * 100).toFixed(1) : 'N/A';
+  print('D2 heat_open_doy in [' + AUTUMN_MIN + ',' + AUTUMN_MAX + ']:');
+  print('   ' + pct + '% of valid pixels' + (parseFloat(pct) > 99 ? '  PASS' : '  FAIL'));
+});
+
+// D3: heat_close_doy in [1, 177] for all valid pixels
+var hcAllMasked = img.select('heat_close_doy').selfMask();
+var hcInRange = hcAllMasked.gte(1).and(hcAllMasked.lte(SPRING_MAX));
+hcInRange.selfMask().reduceRegion({
+  reducer: ee.Reducer.mean().combine(ee.Reducer.count(), null, true),
+  geometry: nhRegion, scale: 55632, maxPixels: 1e8, bestEffort: true
+}).evaluate(function(s) {
+  var pct = s['heat_close_doy_mean'] !== null
+            ? (s['heat_close_doy_mean'] * 100).toFixed(1) : 'N/A';
+  print('D3 heat_close_doy in [1,' + SPRING_MAX + ']:');
+  print('   ' + pct + '% of valid pixels' + (parseFloat(pct) > 99 ? '  PASS' : '  FAIL'));
+});
+
+// D4: hard_heat_close_doy >= heat_close_doy where both not at fallback
+// (35C should fire at same time or later than 28C in a typical spring warming sequence;
+//  WARN only — a brief 35C spike before sustained 28C is physically possible)
+var bothValid = img.select('heat_close_doy').gt(0)
+  .and(img.select('hard_heat_close_doy').lt(SPRING_MAX));
+var closeVsHard = img.select('hard_heat_close_doy')
+  .subtract(img.select('heat_close_doy'))
+  .updateMask(bothValid);
+closeVsHard.reduceRegion({
+  reducer: ee.Reducer.mean().combine(ee.Reducer.min(), null, true),
+  geometry: nhRegion, scale: 55632, maxPixels: 1e8, bestEffort: true
+}).evaluate(function(s) {
+  var mean = s['hard_heat_close_doy_mean'] !== null
+             ? s['hard_heat_close_doy_mean'].toFixed(1) : 'N/A';
+  var mn   = s['hard_heat_close_doy_min']  !== null
+             ? Math.round(s['hard_heat_close_doy_min']) : 'N/A';
+  print('D4 (hard_heat_close - heat_close) where 35C fires:');
+  print('   mean diff=' + mean + '  min diff=' + mn +
+        ' (negative = 35C fired before sustained 28C; physically possible, WARN if large)');
+});
+
+// ── E. SENTINEL / FALLBACK COVERAGE ──────────────────────────────
+print('');
+print('── E. SENTINEL / FALLBACK COVERAGE ────────');
+print('Fallback values are assigned when a threshold is never crossed.');
+print('High fallback fraction in certain bands is expected:');
+print('  heat_open=185  -> cool-temperate zones where Tmax never sustains >28C in summer');
+print('  moisture_open=361 -> arid zones with no autumn rainfall (Egypt, Arabian coast)');
+print('  heat_close=177  -> cool zones where spring never sustains 28C (NW Europe)');
+print('  hard_heat_close=177 -> most of NH (8-day mean 35C is rare even in hot spring)');
+
+// Count total valid pixels
+img.select('heat_open_doy').selfMask().reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: nhRegion, scale: 55632, maxPixels: 1e8, bestEffort: true
+}).evaluate(function(tv) {
+  var total = tv['heat_open_doy'] || 1;
+  print('Total valid (non-zero) pixels sampled at 0.5 deg: ~' + total);
+
+  var sentinels = [
+    {label: 'heat_open_doy = ' + AUTUMN_MIN + ' (always cool)',
+     band: 'heat_open_doy', val: AUTUMN_MIN},
+    {label: 'moisture_open_doy = ' + AUTUMN_MAX + ' (no autumn moisture)',
+     band: 'moisture_open_doy', val: AUTUMN_MAX},
+    {label: 'heat_close_doy = ' + SPRING_MAX + ' (no spring re-warming)',
+     band: 'heat_close_doy', val: SPRING_MAX},
+    {label: 'hard_heat_close_doy = ' + SPRING_MAX + ' (no 35C event)',
+     band: 'hard_heat_close_doy', val: SPRING_MAX},
+    {label: 'backward_sow_irr = 392 (fallback)',
+     band: 'backward_sow_irr', val: 392}
+  ];
+
+  sentinels.forEach(function(sc) {
+    img.select(sc.band).selfMask().eq(sc.val).selfMask()
+      .reduceRegion({
+        reducer: ee.Reducer.count(),
+        geometry: nhRegion, scale: 55632, maxPixels: 1e8, bestEffort: true
+      }).evaluate(function(s) {
+        var cnt = s[sc.band] || 0;
+        var pct = (cnt / total * 100).toFixed(1);
+        print('  ' + sc.label + ': ' + cnt + ' px (' + pct + '%)');
+      });
+  });
+});
+
+// ── F. LATITUDINAL BAND STATISTICS ───────────────────────────────
+// Expected gradient:
+//   heat_open_doy DECREASES with latitude:
+//     tropics/subtropics (20-30N): summer heat persists longest -> later autumn cool
+//     temperate (40-50N): cooler summers -> heat_open earlier, approaches fallback 185
+//   heat_close_doy INCREASES with latitude:
+//     subtropics (20-30N): spring warming hits 28C early (Feb-Mar, DOY 33-90)
+//     temperate (40-50N): spring warming hits 28C late (May-Jun, DOY 120-177)
+print('');
+print('── F. LATITUDINAL BAND STATS ───────────────');
+print('Expected: heat_open decreases with lat; heat_close increases with lat');
+
+var LAT_BANDS = [
+  {name: '10-20N', minLat: 10, maxLat: 20},
+  {name: '20-30N', minLat: 20, maxLat: 30},
+  {name: '30-40N', minLat: 30, maxLat: 40},
+  {name: '40-50N', minLat: 40, maxLat: 50},
+  {name: '50-60N', minLat: 50, maxLat: 60}
+];
+
+LAT_BANDS.forEach(function(lb) {
+  var geom = ee.Geometry.Polygon(
+    [[[-180, lb.minLat], [180, lb.minLat], [180, lb.maxLat], [-180, lb.maxLat]]],
+    null, false);
+  img.select(['heat_open_doy', 'heat_close_doy']).selfMask()
+    .reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom, scale: 55632, maxPixels: 1e8, bestEffort: true
+    }).evaluate(function(s) {
+      var ho = s.heat_open_doy  ? Math.round(s.heat_open_doy)  : '--';
+      var hc = s.heat_close_doy ? Math.round(s.heat_close_doy) : '--';
+      print('  ' + lb.name + ':  heat_open=' + ho + '  heat_close=' + hc);
+    });
+});
+
+// ── G. OCEAN / LAND MASK SANITY CHECK ────────────────────────────
+print('');
+print('── G. OCEAN / LAND MASK CHECK ──────────────');
+print('Ocean pixels should be 0 (masked then unmasked); land pixels should be >0.');
+
+var CHECK_POINTS = [
+  {name: 'Pacific Ocean (ocean)',  lon: 150.0, lat: 20.0,  expectZero: true},
+  {name: 'Indian Ocean (ocean)',   lon: 75.0,  lat: 5.0,   expectZero: true},
+  {name: 'NW Africa desert',       lon: 5.0,   lat: 22.0,  expectZero: false},
+  {name: 'India (Punjab area)',    lon: 73.0,  lat: 30.0,  expectZero: false},
+  {name: 'Germany (crop land)',    lon: 10.0,  lat: 51.0,  expectZero: false},
+  {name: 'Arctic (>70N, no crop)', lon: 20.0,  lat: 72.0,  expectZero: true}
+];
+
+var checkFC = ee.FeatureCollection(CHECK_POINTS.map(function(p) {
+  return ee.Feature(ee.Geometry.Point([p.lon, p.lat]),
+                    {ptname: p.name, expectZero: p.expectZero});
+}));
+
+img.select('heat_open_doy').sampleRegions({
+  collection: checkFC, scale: 11132, geometries: false
+}).evaluate(function(fc) {
+  if (!fc || !fc.features) { print('ERROR: mask check failed'); return; }
+  fc.features.forEach(function(f) {
+    var v   = Math.round(f.properties.heat_open_doy);
+    var ez  = f.properties.expectZero;
+    var nm  = f.properties.ptname;
+    var ok  = ez ? (v === 0) : (v > 0);
+    print('  ' + nm + ': heat_open=' + v +
+          ' (expect ' + (ez ? '0' : '>0') + ')' +
+          (ok ? '  PASS' : '  FAIL'));
+  });
+});
+
+// ── H. DISTRIBUTION CHARTS (supplementary) ───────────────────────
+print('');
+print('── H. DISTRIBUTION CHARTS (supplementary) ─');
+print('(Charts render in console panel — skip on mobile if needed)');
+
+['heat_open_doy', 'heat_close_doy', 'moisture_open_doy', 'backward_sow_irr']
+  .forEach(function(b) {
+    print(ui.Chart.image.histogram({
+      image: img.select(b).selfMask(),
+      region: nhRegion,
+      scale: 55632,
+      maxPixels: 1e8
+    }).setOptions({
+      title: b + ' distribution',
+      hAxis: {title: 'DOY'},
+      vAxis: {title: 'count'},
+      legend: {position: 'none'}
+    }));
+  });
+
+// ── SUMMARY NOTES ─────────────────────────────────────────────────
+print('');
+print('================================================');
+print('INTERPRETATION NOTES:');
+print('1. heat_open_doy: bimodal expected — early peak near 185 (always-cool');
+print('   NW Europe + high lat) and main peak 240-300 (subtropical/continental).');
+print('2. heat_close_doy: strong latitudinal gradient, rightward skew toward');
+print('   fallback 177 for cool-temperate zones.');
+print('3. moisture bands: extreme bimodality OK — arid zones cluster at');
+print('   moisture_open=361, humid zones cluster near AUTUMN_MIN.');
+print('4. backward_sow_irr: should mirror heat_close shifted by +215,');
+print('   with clean spike at 392 (fallback = 177+215) for cool zones.');
+print('5. hard_heat_close_doy: heavy right-skew toward fallback 177 is normal');
+print('   (8-day mean Tmax >= 35C sustained is rare across most of NH).');
+print('6. Single-year run: all statistics are from 1951 data only. The P20');
+print('   reducer on a 1-image collection returns the image unchanged.');
+print('   Re-run with 30 years before using in production bigStatic_rabi.');
+print('================================================');
