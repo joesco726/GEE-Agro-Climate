@@ -364,6 +364,5 @@ Export.image.toDrive({
   scale: exportScale,
   region: P.GEOMETRY,
   crs: 'EPSG:4326',
-  maxPixels: 1e13,
-  pyramidingPolicy: {'.default': 'sample'}
+  maxPixels: 1e13
 });
