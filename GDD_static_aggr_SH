@@ -1,0 +1,174 @@
+// ======================================================
+// STATIC LAYERS FOR CROP ROTATION GDD — SOUTHERN HEMISPHERE ONLY (v33-South)
+// • Full merge of latest North logic + all SH-specific solutions from v32-South
+// • Winter-centered pivot with year-crossing rollover (handles flipped seasons)
+// • Robust GSL that accounts for DOY wrap-around
+// • Aggressiveness expression adapted with seasonal DOY shift (x = shiftedBegin - 182)
+// • Final bands exactly as requested: mean_min_soil_c, safeBegin, farmerBegin, safeEnd, autumn_start_doy, autumn_end_doy
+// • Geometry + latitude mask + explicit .clip(region)
+// ======================================================
+
+var startYear = 1951;
+var endYear = 1980;
+var testMode = false;
+var productionDeg = 0.1;
+var pureClimaticMaskAsset = 'projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg';
+var exportScale = testMode ? 55632 : Math.round(productionDeg * 111320);
+
+// === GEOMETRY ===
+var buenosAiresLargeTest = ee.Geometry.Rectangle([-61.5, -37.25, -55.5, -32.25]);
+// Safe polygon that avoids date-line issues
+var southernHemisphere = ee.Geometry.Polygon(
+  [[[-180, -90], [180, -90], [180, 0], [-180, 0]]], null, false);
+var region = testMode ? buenosAiresLargeTest : southernHemisphere;
+
+// === EARLY LATITUDE MASK ===
+var latitude = ee.Image.pixelLonLat().select('latitude');
+var southMask = latitude.lt(0);
+
+// === MASKS ===
+var pureClimaticMask = ee.Image(pureClimaticMaskAsset).select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .first().select('soil_temperature_level_1').mask().not();
+var computeMask = pureClimaticMask.and(oceanMask.not()).updateMask(southMask);
+
+// === 1. MEAN MIN SOIL TEMP ===
+var meanMinSoilC = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(y) {
+    return ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .select('soil_temperature_level_1')
+      .min().subtract(273.15)
+      .updateMask(computeMask);
+  })
+).mean().rename('mean_min_soil_c');
+
+// === 2. WINTER-CENTERED PIVOT (SH) — handles flipped seasons + date wrapping ===
+var thermalLayers = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(y) {
+    var col = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .select(['soil_temperature_level_1', 'temperature_2m_min', 'snow_cover']);
+  
+    var daily = col.map(function(img) {
+      var soilC = img.select('soil_temperature_level_1').subtract(273.15);
+      var tminC = img.select('temperature_2m_min').subtract(273.15);
+      var snow = img.select('snow_cover');
+      var doy = ee.Image.constant(ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)).toInt32().rename('doy');
+      var limiting = snow.gt(0.05).or(soilC.lt(5)).or(tminC.lt(0)).rename('limiting');
+      return img.addBands([doy, limiting]);
+    });
+
+    var pivotDOY = 182;
+    var nextYear = ee.Number(y).add(1);
+    var nextCol = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+      .filter(ee.Filter.calendarRange(nextYear, nextYear, 'year'))
+      .select(['soil_temperature_level_1', 'temperature_2m_min', 'snow_cover']);
+    var nextDaily = nextCol.map(function(img) {
+      var soilC = img.select('soil_temperature_level_1').subtract(273.15);
+      var tminC = img.select('temperature_2m_min').subtract(273.15);
+      var snow = img.select('snow_cover');
+      var doy = ee.Image.constant(ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)).toInt32().rename('doy');
+      var limiting = snow.gt(0.05).or(soilC.lt(5)).or(tminC.lt(0)).rename('limiting');
+      return img.addBands([doy, limiting]);
+    });
+
+    // Begin window (post-winter → next year April) — handles year rollover
+    var beginWindow = daily.filter(ee.Filter.calendarRange(pivotDOY, 366, 'day_of_year'))
+      .merge(nextDaily.filter(ee.Filter.calendarRange(1, 120, 'day_of_year')));
+    var limDOY_begin = beginWindow.map(function(img) {
+      return img.select('doy').updateMask(img.select('limiting')).rename('lim_doy');
+    });
+    var lastLimitingSH = limDOY_begin.reduce(ee.Reducer.max()).unmask(182);
+    var thermalBeginSafe = lastLimitingSH.add(7).max(1).rename('thermal_begin_safe_doy');
+
+    // End window (Jan → early September)
+    var endWindow = daily.filter(ee.Filter.calendarRange(1, 243, 'day_of_year'));
+    var limDOY_end = endWindow.map(function(img) {
+      return img.select('doy').updateMask(img.select('limiting')).rename('lim_doy');
+    });
+    var firstLimitingSH = limDOY_end.reduce(ee.Reducer.min()).unmask(182);
+    var thermalEndSafe = firstLimitingSH.subtract(1).rename('thermal_end_safe_doy');
+
+    return thermalBeginSafe.addBands(thermalEndSafe).updateMask(computeMask);
+  })
+);
+
+var meanThermalEndSafe = thermalLayers.select('thermal_end_safe_doy').mean().round();
+var shiftedBegin = thermalLayers.select('thermal_begin_safe_doy').mean().round();
+
+// Growing Season Length (robust for SH — accounts for year wrap)
+var gsl = meanThermalEndSafe.add(365).subtract(shiftedBegin).mod(365);
+
+// === 3. SPRING AGGRESSIVENESS (adapted for SH seasonal DOYs) ===
+var safeBegin = shiftedBegin.rename('safeBegin');
+
+// Combine with seasonal DOY shift (x = shiftedBegin - 182) so breakpoints stay meaningful
+var springInputs = shiftedBegin.subtract(182).rename('x')
+  .addBands(gsl.rename('gsl'));
+
+var aggressiveness = springInputs.expression(
+  'min(max(b("x") - 96, 0) * (50 / 34), 50) ' +
+  '* max(0, min(1, 1 - (b("gsl") - 175) / 50))'
+);
+
+var farmerBegin = shiftedBegin.subtract(aggressiveness)
+  .max(1)
+  .round()
+  .rename('farmerBegin');
+
+var safeEnd = meanThermalEndSafe.rename('safeEnd');
+
+// === 4. AUTUMN LOGIC (latest North rules, now on SH data) ===
+var autumnStartDOY = meanThermalEndSafe
+  .subtract(70)
+  .max(1)
+  .round()
+  .rename('autumn_start_doy');
+
+// endWindow piecewise based on GSL (same as latest North)
+var endWindow = gsl.rename('gsl').expression(
+  '15 - 30 * min(max(b("gsl") - 130, 0) / 50, 1)'
+).rename('end_window_days');
+
+var autumnEndDOY = meanThermalEndSafe
+  .subtract(endWindow)
+  .round()
+  .rename('autumn_end_doy');
+
+// === COMBINE + EXPLICIT CLIP TO GEOMETRY ===
+var staticLayers = meanMinSoilC
+  .addBands(safeBegin)
+  .addBands(farmerBegin)
+  .addBands(safeEnd)
+  .addBands(autumnStartDOY)
+  .addBands(autumnEndDOY)
+  .unmask(0)
+  .clip(region);
+
+// === EXPORTS ===
+var exportName = testMode ? 'StaticCropRotationLayers_Test_v33-South' : 'StaticCropRotationLayers_1951_1980_03deg_v33-South';
+var timestamp = new Date().toISOString().slice(0,19).replace(/[:.]/g, '-');
+
+Export.image.toAsset({
+  image: staticLayers, 
+  description: exportName, 
+  assetId: 'users/joesco726/' + exportName, 
+  scale: exportScale, 
+  region: region, 
+  crs: 'EPSG:4326', 
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: staticLayers.toFloat(),
+  description: exportName + '_drive_' + timestamp,
+  folder: 'GSL_Exports_South',
+  fileNamePrefix: exportName + '_' + timestamp,
+  scale: exportScale,
+  region: region,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+print('v33-South ready — full Southern Hemisphere with all latest features + SH fixes');
