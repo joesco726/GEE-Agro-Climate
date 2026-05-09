@@ -1,0 +1,380 @@
+// ===================================================================
+// GEE Script: Global Vernalization Viability Static (1951-1980) v3
+// Model: Parton-Logan diurnal temperature reconstruction + quadratic VR
+//        applied to soil temperature (0-7cm depth), snow-conditional
+//
+// Why soil_temperature_level_1 rather than temperature_2m:
+//   - The vernalization-sensitive crown/meristem sits at ~1-2cm depth
+//     during vegetative establishment, inside the 0-7cm ERA5-Land layer.
+//   - ERA5-Land soil temperature already incorporates snow insulation via
+//     its coupled land-surface scheme. In continental Russia, northern
+//     China, and the Canadian Prairies, air temps reach -20°C while soil
+//     at 2cm stays -1 to +3°C (ideal vernalizing range).
+//   - The daily MEAN soil temperature conflates solar-heated daytime peaks
+//     with cold nights. Mediterranean sites (Jerusalem, Tunis) hit T_mean
+//     ≥12°C and receive VR=0 all day under v2, even though their nights
+//     (6-9°C) are in the optimal vernalizing range.
+//
+// Why Parton-Logan over a 50/50 Tmin/Tsoil blend:
+//   - Parton-Logan correctly tracks hours below the 12°C upper cutoff
+//     rather than just estimating T_eff at a single point in the day.
+//   - Exponential nighttime decay (coefficient b=2.2) keeps temperatures
+//     near T_min for the second half of each night — longer than a pure
+//     sinusoid would predict — giving ~22/24 h below cutoff at Jerusalem
+//     vs the ~12/24 a sinusoid-only blend implies.
+//   - A_soil = 0.4 × A_air captures soil thermal mass damping.
+//
+// Snow-conditional path:
+//   - snow_cover > 0.05: soil is already isothermal near 0°C due to
+//     snow insulation. Applying an air-amplitude correction would add
+//     spurious diurnal swing where none exists. Use soil_temp directly.
+//   - snow_cover ≤ 0.05: apply full Parton-Logan reconstruction.
+//
+// Outputs (3-band global image):
+//   pct_vern_wheat_50     — % of 1951-1980 years meeting landrace winter
+//                           wheat requirement (50 VR units). Calibrated
+//                           to Red Lammas, Spelt, continental aestivum
+//                           landraces (~7 weeks effective cold at optimum).
+//   pct_vern_barley_25    — % of years meeting landrace winter barley
+//                           requirement (25 VR units). Calibrated to
+//                           Bere barley and 6-row landraces (~3.5 weeks).
+//   mean_vernal_progress  — mean accumulated VR units across 30 years
+//                           (continuous; useful for marginal zone analysis)
+//
+// No iterate required: the static only needs "did it complete?" per year,
+// which is a simple sum-and-threshold.
+// Both hemispheres included with season-shifted windows.
+// ===================================================================
+
+// Computed once at module level; reused across all 30 yearly calls and for MARGINAL_MASK.
+var LATITUDE = ee.Image.pixelLonLat().select('latitude');
+
+// Marginal zone: pixels where climatological mean winter soil temp falls in [LOW, HIGH].
+// Only these pixels receive the full Parton-Logan computation; the rest are filled from
+// the v2 asset (where v2 and v3 produce the same result anyway).
+// NH peak-cold months: Nov–Feb.  SH equivalent: May–Aug.
+var MARGINAL_ZONE_LOW_C  =  8;   // °C — adjust to widen/narrow the correction zone
+var MARGINAL_ZONE_HIGH_C = 16;   // °C
+var _soilClima   = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .select('soil_temperature_level_1')
+  .filterDate('1951-01-01', '1980-12-31');
+var _nhWinter    = _soilClima.filter(ee.Filter.calendarRange(11, 2, 'month')).mean().subtract(273.15);
+var _shWinter    = _soilClima.filter(ee.Filter.calendarRange(5,  8, 'month')).mean().subtract(273.15);
+var _winterMean  = _nhWinter.where(LATITUDE.lt(0), _shWinter);
+var MARGINAL_MASK = _winterMean.gte(MARGINAL_ZONE_LOW_C).and(_winterMean.lte(MARGINAL_ZONE_HIGH_C));
+
+// Load ERA5-Land with land mask AND marginal zone mask applied at collection level.
+// soil_temperature_level_1 is undefined over ocean; temperature_2m and snow_cover
+// are defined globally. Masking all bands to the land+marginal footprint prevents the
+// Parton-Logan computation from running on ocean pixels (~71%) and non-marginal land
+// where v2 and v3 produce identical results.
+var ERA5_LAND = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .select([
+    'soil_temperature_level_1',
+    'temperature_2m_min',
+    'temperature_2m_max',
+    'snow_cover'
+  ])
+  .map(function(img) {
+    var landMask = img.select('soil_temperature_level_1').mask();
+    return img.updateMask(landMask.and(MARGINAL_MASK));
+  });
+
+var START_YEAR = 1951;
+var END_YEAR   = 1980;
+
+// Quadratic VR = max(0, 1 - ((T - Topt) / A)²)
+// Effective range: VR=0 below -1°C (soil freezing suppresses enzymatic activity)
+//                 VR=0 above 12°C (devernalization risk begins; meristem de-acclimation)
+//                 VR=1 at Topt=5°C (optimal for crown tissue at 0-7cm)
+var vernalOptTempC  = 5.0;
+var vernalAmpC      = 10.0;
+var vernalMinTempC  = -1.0;
+var vernalMaxTempC  = 12.0;
+
+// Parton-Logan parameters
+var PL_L  = 1.5;   // lag after sunrise/sunset in hours (standard)
+var PL_b  = 2.2;   // nighttime exponential decay coefficient (Parton & Logan 1981)
+var SNOW_THRESH = 0.05;  // fractional snow cover above which soil is treated as isothermal
+
+// Vernalization requirements: calibrated to pre-modern landrace cultivars (1500-1800 era)
+// No facultative/semi-winter wheat existed as a crop class — spring/winter distinction was binary.
+// Landrace winter wheats had stronger requirements than modern bred varieties.
+var VERN_REQ_WHEAT  = 50;   // Red Lammas, Spelt, continental aestivum landraces
+var VERN_REQ_BARLEY = 25;   // Bere and similar 6-row landraces
+
+// Helper: Kelvin → Celsius
+function kToCelsius(img, bandName) {
+  return img.select(bandName).subtract(273.15);
+}
+
+// ===================================================================
+// Per-image Parton-Logan diurnal VR computation
+// Requires: soilC, tminC, tmaxC, snow bands; latitude and doy as images
+// Returns: vernal_rate image (VR units per day, fraction-weighted)
+// ===================================================================
+var computeDailyVR = function(img, latitude, doyImg) {
+  var soilC = kToCelsius(img, 'soil_temperature_level_1');
+  var tminC = kToCelsius(img, 'temperature_2m_min');
+  var tmaxC = kToCelsius(img, 'temperature_2m_max');
+  var snow  = img.select('snow_cover');  // ERA5-Land DAILY_AGGR snow_cover is already 0-1 fraction
+
+  // ── Day-length from Parton-Logan / standard solar geometry ──────────
+  var phi    = latitude.multiply(Math.PI / 180);
+  var delta  = ee.Image.constant(23.45 * Math.PI / 180)
+                 .multiply(doyImg.subtract(81).multiply(2 * Math.PI / 365).sin());
+  // ws = half-day angle; clamp argument to [-1,1] to avoid acos domain errors at poles
+  var tanArg = phi.tan().multiply(delta.tan()).multiply(-1).max(-1).min(1);
+  var ws     = tanArg.acos();
+  var DL     = ws.multiply(24 / Math.PI);                   // daylight hours
+  var NL     = ee.Image.constant(24).subtract(DL);          // nighttime hours
+  var DL_eff = DL.add(2 * PL_L);                            // effective daylight for sine (DL + 2L)
+
+  // ── Soil diurnal amplitude (thermal mass damping) ────────────────────
+  // A_soil ≈ 0.4 × A_air; A_air = (tmax - tmin) / 2
+  var A_soil  = tmaxC.subtract(tminC).max(0).multiply(0.5 * 0.4);
+  var Tmin_s  = soilC.subtract(A_soil);                     // reconstructed soil minimum
+  // T_ss = soil temperature at sunset (end of Parton-Logan daytime sine)
+  var T_ss    = A_soil.multiply(DL.multiply(Math.PI).divide(DL_eff).sin()).add(Tmin_s);
+
+  // ── Hours below upper cutoff in DAYTIME ─────────────────────────────
+  // Daytime: T(t) = A_soil × sin(π×t/DL_eff) + Tmin_s, 0 ≤ t ≤ DL
+  // T exceeds vernalMaxTempC when sin(π×t/DL_eff) > z where z=(Tc-Tmin_s)/A_soil
+  var Tc  = vernalMaxTempC;  // 12°C
+  var z   = ee.Image.constant(Tc).subtract(Tmin_s)
+              .divide(A_soil.max(0.01)).min(1).max(-1);
+  var asinZ = z.asin();
+
+  // Hours above cutoff during daytime = (π - 2×arcsin(z)) × DL_eff/π  (chord above the line)
+  // Clamp to [0, DL]
+  var hoursAboveDay = ee.Image(Math.PI).subtract(asinZ.multiply(2))
+    .multiply(DL_eff.divide(Math.PI))
+    .max(0).min(DL)
+    .where(z.gte(1),  ee.Image(0))   // T_peak < Tc → nothing exceeds cutoff
+    .where(z.lte(-1), DL);           // T_min > Tc → entire day above cutoff (should not occur but guards NaN)
+
+  var hoursBelowDay = DL.subtract(hoursAboveDay).max(0);
+
+  // ── T_eff during daytime below-cutoff period ────────────────────────
+  // Integral of A_soil×sin(π×t/DL_eff) + Tmin_s over [0, t1] divided by t1
+  // where t1 = arcsin(z) × DL_eff/π (first crossing of cutoff from below)
+  // = A_soil×DL_eff/(π×t1) × (1 - cos(arcsin(z))) + Tmin_s
+  var cosAsinZ = ee.Image(1).subtract(z.pow(2)).max(0).sqrt();
+  var t1 = asinZ.multiply(DL_eff.divide(Math.PI)).max(0.01);
+
+  // Partial day (cutoff crossed before DL): integral from 0 to t1
+  var T_eff_day_partial = A_soil.multiply(DL_eff.divide(Math.PI))
+    .divide(t1)
+    .multiply(ee.Image(1).subtract(cosAsinZ))
+    .add(Tmin_s);
+
+  // Full day (T_ss ≤ Tc, cutoff never crossed): integral from 0 to DL
+  var cosDL = DL.multiply(Math.PI).divide(DL_eff).cos().multiply(-1); // -cos(π×DL/DL_eff)
+  var T_eff_day_full = A_soil.multiply(DL_eff.divide(Math.PI))
+    .divide(DL.max(0.01))
+    .multiply(ee.Image(1).add(cosDL))   // 1 - (-cos) = 1 + cos
+    .add(Tmin_s);
+
+  // Select: use full-day formula when T_ss ≤ Tc (z ≥ 1 means A_soil doesn't reach cutoff)
+  var T_eff_day = T_eff_day_partial.where(z.gte(1), T_eff_day_full);
+
+  // Clamp T_eff_day to valid VR range (numerical edge cases near poles)
+  T_eff_day = T_eff_day.max(vernalMinTempC - 1).min(vernalMaxTempC);
+
+  // ── Hours below upper cutoff in NIGHTTIME ────────────────────────────
+  // Nighttime: T(t) = (T_ss - Tmin_s) × exp(-b×t/NL) + Tmin_s, 0 ≤ t ≤ NL
+  // Crosses Tc downward at t_cross = -NL/b × ln((Tc - Tmin_s)/(T_ss - Tmin_s))
+  var delta_ss = T_ss.subtract(Tmin_s).max(0.001);  // T_ss - Tmin_s; denominator guard
+  var ratio    = ee.Image.constant(Tc).subtract(Tmin_s)
+                   .divide(delta_ss).max(0.001).min(1);
+  var t_cross  = NL.multiply(-1).divide(PL_b)
+                   .multiply(ratio.log())
+                   .max(0).min(NL);
+
+  // Hours below Tc during night:
+  //   If T_ss ≤ Tc: entire night is below cutoff (t_cross=0 crossing is immediate)
+  //   Otherwise: NL - t_cross hours are below Tc
+  var hoursBelowNight = NL.subtract(t_cross)
+    .where(T_ss.lte(Tc), NL)
+    .max(0);
+
+  // ── T_eff during nighttime below-cutoff period ───────────────────────
+  // Integral of (T_ss-Tmin_s)×exp(-b×t/NL) + Tmin_s from t_cross to NL, divided by (NL-t_cross)
+  // = delta_ss × NL/b × (exp(-b×t_cross/NL) - exp(-b)) / (NL - t_cross) + Tmin_s
+  var expTcross  = t_cross.multiply(-PL_b).divide(NL).exp();          // exp(-b × t_cross/NL)
+  var expB_const = Math.exp(-PL_b);                                    // exp(-b) ≈ 0.111
+
+  var T_eff_night_partial = delta_ss.multiply(NL).divide(PL_b)
+    .multiply(expTcross.subtract(expB_const))
+    .divide(hoursBelowNight.max(0.01))
+    .add(Tmin_s);
+
+  // Full night (T_ss ≤ Tc): integral from 0 to NL
+  var T_eff_night_full = delta_ss.multiply(1 - expB_const).divide(PL_b).add(Tmin_s);
+
+  var T_eff_night = T_eff_night_partial.where(T_ss.lte(Tc), T_eff_night_full);
+
+  T_eff_night = T_eff_night.max(vernalMinTempC - 1).min(vernalMaxTempC);
+
+  // ── Combine day and night into daily fraction-weighted VR ────────────
+  var hoursTotal = hoursBelowDay.add(hoursBelowNight).max(0.01);
+
+  // Weighted effective temperature across both sub-day periods
+  var T_eff = T_eff_day.multiply(hoursBelowDay)
+    .add(T_eff_night.multiply(hoursBelowNight))
+    .divide(hoursTotal);
+
+  // Apply lower cutoff check and quadratic VR to T_eff
+  var inLowerRange = T_eff.gte(vernalMinTempC);
+  var quadratic    = ee.Image(1)
+    .subtract(T_eff.subtract(vernalOptTempC).divide(vernalAmpC).pow(2))
+    .max(0);
+
+  // VR_daily = fraction_of_day_in_range × quadratic(T_eff)
+  var vrFree = inLowerRange.multiply(quadratic)
+    .multiply(hoursTotal.divide(24));
+
+  // ── Snow-conditional override ────────────────────────────────────────
+  // Under significant snow, soil is effectively isothermal; apply quadratic to soil mean directly
+  var soilInRange  = soilC.gte(vernalMinTempC).and(soilC.lte(vernalMaxTempC));
+  var quadSoil     = ee.Image(1)
+    .subtract(soilC.subtract(vernalOptTempC).divide(vernalAmpC).pow(2))
+    .max(0);
+  var vrSnow = soilInRange.multiply(quadSoil);  // full day weight (soil isothermal all 24h)
+
+  var hasSnow = snow.gt(SNOW_THRESH);
+  return vrFree.where(hasSnow, vrSnow).rename('vernal_rate');
+};
+
+// ===================================================================
+// Sum VR across all images in a filtered collection for one season
+// ===================================================================
+var computeVernSum = function(col, latitude) {
+  return col.map(function(img) {
+    var doyImg = ee.Image.constant(img.date().getRelative('day', 'year').add(1));
+    return computeDailyVR(img, latitude, doyImg);
+  }).sum().rename('vernal_progress');
+};
+
+// ===================================================================
+// Per-year: load NH and SH windows, combine by latitude
+// ===================================================================
+var getYearlyVernalization = function(year) {
+  year = ee.Number(year);
+
+  // Northern Hemisphere: Oct (prev year) → May (current year, exclusive → through May 31)
+  var nhProgress = computeVernSum(
+    ERA5_LAND.filterDate(
+      ee.Date.fromYMD(year.subtract(1), 10, 1),
+      ee.Date.fromYMD(year, 6, 1)
+    ),
+    LATITUDE
+  );
+
+  // Southern Hemisphere: Apr → Nov (current year; offset 6 months from NH)
+  var shProgress = computeVernSum(
+    ERA5_LAND.filterDate(
+      ee.Date.fromYMD(year, 4, 1),
+      ee.Date.fromYMD(year, 12, 1)
+    ),
+    LATITUDE
+  );
+
+  // Merge: NH for lat ≥ 0, SH for lat < 0
+  var vernProgress = nhProgress
+    .where(LATITUDE.lt(0), shProgress)
+    .rename('vernal_progress');
+
+  var vernSuccessWheat  = vernProgress.gte(VERN_REQ_WHEAT).toByte()
+                            .rename('vern_success_wheat');
+  var vernSuccessBarley = vernProgress.gte(VERN_REQ_BARLEY).toByte()
+                            .rename('vern_success_barley');
+
+  return vernProgress
+    .addBands(vernSuccessWheat)
+    .addBands(vernSuccessBarley);
+};
+
+// ===================================================================
+// Build collection: one 3-band image per year, aggregate across 30 years
+// ===================================================================
+var years = ee.List.sequence(START_YEAR, END_YEAR);
+var yearlyCollection = ee.ImageCollection.fromImages(years.map(getYearlyVernalization));
+
+var pctWheat  = yearlyCollection.select('vern_success_wheat')
+  .mean().multiply(100).rename('pct_vern_wheat_50');
+
+var pctBarley = yearlyCollection.select('vern_success_barley')
+  .mean().multiply(100).rename('pct_vern_barley_25');
+
+var meanVernProgress = yearlyCollection.select('vernal_progress')
+  .mean().rename('mean_vernal_progress');
+
+// Outside the marginal zone, v2 and v3 produce the same result — fill from v2 asset.
+var _v2 = ee.Image('projects/thermal-growing-seasons/assets/vernalization_static_1951_1980_v2_landrace');
+var vernalizationImage = _v2.where(MARGINAL_MASK,
+  pctWheat.addBands(pctBarley).addBands(meanVernProgress));
+
+// ===================================================================
+// VISUALIZATION
+// ===================================================================
+var pctVis = {
+  min: 0, max: 100,
+  palette: ['#d73027', '#f46d43', '#fee08b', '#a6d96a', '#1a9850']
+};
+var progressVis = {
+  min: 0, max: 80,
+  palette: ['#d73027', '#f46d43', '#fee08b', '#a6d96a', '#1a9850']
+};
+
+Map.addLayer(pctWheat,         pctVis,      'Landrace winter wheat ≥50 VR (%)');
+Map.addLayer(pctBarley,        pctVis,      'Landrace winter barley ≥25 VR (%)');
+Map.addLayer(meanVernProgress, progressVis, 'Mean vernal progress (units)');
+Map.setCenter(20, 45, 3);
+
+print('✅ Vernalization static v3 (1951-1980) ready');
+print('   • Calibrated to pre-modern landrace cultivars (1500-1800 era)');
+print('   • Soil temperature (0-7cm) as base — snow insulation implicit');
+print('   • Parton-Logan diurnal model: A_soil=0.4×A_air, b=2.2, L=1.5h');
+print('   • Snow-conditional: snow_cover>0.05 → isothermal soil path');
+print('   • Quadratic VR: opt=' + vernalOptTempC + '°C, amp=±' + vernalAmpC + '°C');
+print('   • Hard cutoffs: ' + vernalMinTempC + '°C to ' + vernalMaxTempC + '°C');
+print('   • Thresholds: wheat=' + VERN_REQ_WHEAT + ' VR units (Red Lammas/Spelt/continental landraces)');
+print('   •             barley=' + VERN_REQ_BARLEY + ' VR units (Bere and 6-row landraces)');
+print('   • Both hemispheres (NH: Oct-May, SH: Apr-Nov)');
+
+// ===================================================================
+// EXPORT (FIXED GLOBAL REGION — prevents antimeridian clipping)
+// ===================================================================
+var globalRegion = ee.Geometry.Polygon(
+  [[[-180, -90], [180, -90], [180, 90], [-180, 90], [-180, -90]]],
+  null, false  // non-geodesic
+);
+
+var assetPath = 'projects/thermal-growing-seasons/assets/vernalization_static_1951_1980_v3_parton_logan';
+
+Export.image.toAsset({
+  image: vernalizationImage,
+  description: 'Vernalization_Static_1951_1980_v3_parton_logan',
+  assetId: assetPath,
+  scale: 11132,
+  region: globalRegion,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326'
+});
+
+Export.image.toDrive({
+  image: vernalizationImage,
+  description: 'Vernalization_Static_1951_1980_v3_parton_logan',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'vernalization_static_1951_1980_v3_parton_logan',
+  scale: 11132,
+  region: globalRegion,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326',
+  fileFormat: 'GeoTIFF'
+});
+
+print('🚀 Export tasks created → Tasks panel → RUN both');
+print('   • Asset → ' + assetPath);
+print('   • Drive → vernalization_static_1951_1980_v3_parton_logan.tif');
