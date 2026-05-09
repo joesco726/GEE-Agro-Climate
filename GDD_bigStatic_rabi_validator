@@ -1,0 +1,640 @@
+// ================================================================
+// RABI DIAGNOSTIC VALIDATOR v2.0
+// Compatible with asset v1.0 (37 bands) and v1.1 (41 bands).
+//
+// Sections:
+//   A — Band presence
+//   B — Spatial map layers (14 layers)
+//   C — Reference pixel extraction (14 pixels, batch)
+//   D — Crop-system PASS/FAIL with FAO calendar benchmarks
+//   E — Cross-band spatial consistency (image-level flags)
+//   F — Global distribution percentiles
+//   G — ppMod effect diagnostic [v1.1]
+//   H — Double-crop zone validation [v1.1]
+//   I — 30-year time-series at anchor pixel [optional]
+// ================================================================
+
+// ── CONFIG ───────────────────────────────────────────────────────
+var HEMISPHERE    = 'NH';    // 'NH' or 'SH'
+var YEAR          = 1965;
+var ASSET_VERSION = 'v12';  // 'v1' for v1.0  |  'v11' for v1.1
+var LOAD_COLLECTION = false; // true → Section I time-series (slow)
+
+var IS_V11 = (ASSET_VERSION === 'v11');
+
+// ── ASSET LOAD ───────────────────────────────────────────────────
+var HEMI_SUFFIX      = HEMISPHERE === 'NH' ? 'North' : 'South';
+var ASSET_BASE       = 'projects/thermal-growing-seasons/assets/RabiMetrics_1951_1980_';
+var SINGLE_ASSET_ID  = ASSET_BASE + HEMI_SUFFIX + '_' + ASSET_VERSION + '/' + YEAR;
+var COLLECTION_ID    = ASSET_BASE + HEMI_SUFFIX + '_' + ASSET_VERSION;
+
+var img = ee.Image(SINGLE_ASSET_ID).toFloat();
+print('▶ Asset:', SINGLE_ASSET_ID);
+
+var SANITY_GEOM = HEMISPHERE === 'NH'
+  ? ee.Geometry.Polygon([[[-180, 0], [180, 0], [180, 42], [-180, 42]]], null, false)
+  : ee.Geometry.Polygon([[[-180, -40], [180, -40], [180, 0], [-180, 0]]], null, false);
+
+// ================================================================
+// SECTION A — BAND PRESENCE
+// ================================================================
+var BANDS_V10 = [
+  'rabi_gdd0_irr', 'rabi_gdd0_rain', 'rabi_gdd10_irr', 'rabi_gdd10_rain',
+  'rabi_yield_mult_irr_pct', 'rabi_yield_mult_rain_pct',
+  'rabi_drought_frac_pct', 'rabi_heat_frac_pct',
+  'rabi_frost_days_0', 'rabi_frost_days_m2',
+  'rabi_precip_mm', 'rabi_water_deficit_mm',
+  'rabi_sow_irr', 'rabi_sow_rain', 'rabi_harvest_doy', 'rabi_maturity_doy',
+  'rabi_season_len_irr', 'rabi_season_len_rain', 'ptq_factor',
+  'kharif_gdd0_irr', 'kharif_gdd0_rain', 'kharif_gdd10_irr', 'kharif_gdd10_rain',
+  'kharif_sorghum_yield_mult_pct', 'kharif_maize_yield_mult_pct',
+  'kharif_rice_rain_yield_mult_pct', 'kharif_rice_irr_yield_mult_pct',
+  'kharif_precip_mm', 'kharif_drought_days',
+  'kharif_heat_stress_rain_gdd', 'kharif_heat_stress_irr_gdd',
+  'kharif_start_doy', 'kharif_rain_start_doy', 'kharif_end_doy',
+  'mean_min_soil_c', 'vern_zone', 'mean_vernal_progress'
+];
+var BANDS_V11 = BANDS_V10.concat([
+  'kharif_gdd10_pp_irr', 'kharif_gdd10_pp_rain',
+  'kharif_gdd10_pp_irr_2nd', 'kharif_gdd10_pp_rain_2nd'
+]);
+var EXPECTED_BANDS = IS_V11 ? BANDS_V11 : BANDS_V10;
+
+img.bandNames().evaluate(function(actual) {
+  print('── A: Band presence ──');
+  var missing = EXPECTED_BANDS.filter(function(b) { return actual.indexOf(b) < 0; });
+  var extra   = actual.filter(function(b) { return EXPECTED_BANDS.indexOf(b) < 0; });
+  if (missing.length === 0) {
+    print('[PASS] All ' + EXPECTED_BANDS.length + ' expected bands present');
+  } else {
+    print('[FAIL] Missing bands: ' + missing.join(', '));
+  }
+  if (extra.length) print('[WARN] Extra bands (unexpected): ' + extra.join(', '));
+  print('Total bands in asset: ' + actual.length);
+});
+
+// ================================================================
+// SECTION B — SPATIAL MAP LAYERS
+// ================================================================
+// Sowing window: NH Oct = DOY ~274, Dec = 365; SH Apr = DOY ~91, Jul = ~195
+var sowPalette = ['#1a1aff','#00ccff','#00ff99','#ffff00','#ff8800'];
+var sowRange   = HEMISPHERE === 'NH' ? [265, 365] : [60, 195];
+Map.addLayer(img.select('rabi_sow_irr'),  {min:sowRange[0], max:sowRange[1], palette:sowPalette}, 'Rabi sow IRR');
+Map.addLayer(img.select('rabi_sow_rain'), {min:sowRange[0], max:sowRange[1], palette:sowPalette}, 'Rabi sow RAIN');
+
+// Harvest: NH Mar = 425, Jul = 577; SH Sep = 244, Dec = 365
+var harvRange = HEMISPHERE === 'NH' ? [390, 570] : [240, 365];
+Map.addLayer(img.select('rabi_harvest_doy'), {min:harvRange[0], max:harvRange[1], palette:['#003300','#009900','#ffff00','#ff9900','#ff0000']}, 'Rabi harvest DOY');
+
+// Season length (days)
+Map.addLayer(img.select('rabi_season_len_irr'), {min:60, max:280, palette:['#ffffcc','#a1dab4','#41b6c4','#2c7fb8','#253494']}, 'Rabi season length IRR (d)');
+
+// GDD0 viability bands: <1300=too cold/short, 1300-1600=barley, >1600=wheat
+var gdd0Palette = ['#440154','#31688e','#35b779','#fde725'];
+Map.addLayer(img.select('rabi_gdd0_irr'),  {min:500, max:4000, palette:gdd0Palette}, 'Rabi GDD0 IRR');
+Map.addLayer(img.select('rabi_gdd10_irr'), {min:0,   max:3000, palette:gdd0Palette}, 'Rabi GDD10 IRR (rice potential)');
+
+// Rabi yield multiplier — irrigated
+Map.addLayer(img.select('rabi_yield_mult_irr_pct'), {min:0, max:100, palette:['#d73027','#f46d43','#fee090','#74add1','#4575b4']}, 'Rabi yield mult IRR');
+
+// Drought fraction — rainfed stress indicator
+Map.addLayer(img.select('rabi_drought_frac_pct'), {min:0, max:100, palette:['#2166ac','#abd9e9','#ffffbf','#fdae61','#d73027']}, 'Rabi drought frac %');
+
+// Kharif GDD10 — crop viability thresholds: 1800=rice/maize, 3200=double rice gate
+var kharPalette = ['#1a1a2e','#16213e','#0f3460','#533483','#e94560','#f5a623','#f8e71c'];
+Map.addLayer(img.select('kharif_gdd10_irr'), {min:0, max:5000, palette:kharPalette}, 'Kharif GDD10 IRR');
+
+// Kharif rice rain yield
+Map.addLayer(img.select('kharif_rice_rain_yield_mult_pct'), {min:0, max:100, palette:['#8b0000','#ff6600','#ffff00','#00cc44','#006622']}, 'Kharif rice rain yield %');
+
+// Kharif precipitation
+Map.addLayer(img.select('kharif_precip_mm'), {min:0, max:2500, palette:['#ffffb2','#fed976','#feb24c','#fd8d3c','#f03b20','#bd0026']}, 'Kharif precip mm');
+
+// Vernalization zone
+Map.addLayer(img.select('vern_zone'), {min:2, max:4, palette:['#e41a1c','#ff7f00','#4daf4a']}, 'Vern zone (2=cold 3=warm 4=tropical)');
+
+// PTQ factor
+Map.addLayer(img.select('ptq_factor'), {min:0.6, max:1.4, palette:['#8e0152','#c51b7d','#f1b6da','#fde0ef','#e6f5d0','#a1d76a','#4d9221']}, 'PTQ factor');
+
+// v1.1 layers
+if (IS_V11) {
+  // ppMod ratio: kharif GDD10 with rice photoperiod suppression vs. without
+  var ppRatio = img.select('kharif_gdd10_pp_irr')
+    .divide(img.select('kharif_gdd10_irr').max(1))
+    .clamp(0, 1);
+  Map.addLayer(ppRatio, {min:0.5, max:1.0, palette:['#d73027','#f46d43','#fee090','#e0f3f8','#4575b4']}, 'v1.1 ppMod ratio (rice DL suppression)');
+
+  // Double-crop: 2nd kharif sub-crop GDD10 — >900 = viable 2nd crop
+  Map.addLayer(img.select('kharif_gdd10_pp_irr_2nd'), {min:0, max:2500, palette:['#111111','#2d004b','#762a83','#c2a5cf','#7fbf7b','#1b7837']}, 'v1.1 Kharif GDD10 2nd crop (0=gate not met)');
+}
+
+// ================================================================
+// SECTION C — REFERENCE PIXEL EXTRACTION (batch via sampleRegions)
+// ================================================================
+// Reference pixels chosen to span all major cropping systems.
+// DOY notation (NH wrapped harvest): +365 offset for Jan 1 onwards.
+// Sources: FAO Crop Calendar, USDA FAS, IRRI Rice Knowledge Bank,
+//   ICARDA wheat calendar data, regional agronomy literature.
+//
+// FAO sow/harvest DOYs below reflect traditional (pre-industrial) practice
+// where documented; modern commercial calendars are used where historical
+// data is unavailable, as sowing windows are driven by climate (little changed).
+
+var ALL_REF_PIXELS = {
+  NH: [
+    // ── Wheat core: Punjab-Sind-Nile irrigated plains ──
+    {name:'Punjab_India',     lon:75.8,  lat:30.9,
+     desc:'Irrigated wheat, Punjab plains. FAO sow: Oct 20-Nov 20 (DOY 293-324), harvest: Mar 20-Apr 30 (DOY 444-485).',
+     fao_sow:[293,324], fao_harv:[444,485],
+     chk:{rabi_sow_irr:[282,342], rabi_harvest_doy:[420,498], rabi_gdd0_irr:[1200,2900],
+          rabi_gdd10_irr:[200,1600], rabi_frost_days_0:[2,55], rabi_precip_mm:[20,220],
+          rabi_yield_mult_irr_pct:[30,100], vern_zone:[2,3],
+          kharif_gdd10_irr:[1800,4600], kharif_precip_mm:[350,1600]}},
+    {name:'Sind_Pakistan',    lon:68.4,  lat:25.4,
+     desc:'Irrigated wheat, Sind plains. FAO sow: Nov 1-Dec 15 (DOY 305-349), harvest: Mar 10-Apr 10 (DOY 434-465). Warmer than Punjab; shorter season.',
+     fao_sow:[305,349], fao_harv:[434,470],
+     chk:{rabi_sow_irr:[295,362], rabi_harvest_doy:[415,485], rabi_gdd0_irr:[1400,3300],
+          rabi_frost_days_0:[0,10], rabi_precip_mm:[10,130], vern_zone:[3,4],
+          kharif_gdd10_irr:[1800,4500]}},
+    {name:'Nile_Delta_Egypt', lon:31.2,  lat:30.8,
+     desc:'Irrigated wheat, Nile Delta. FAO sow: Nov 15-Dec 10 (DOY 319-344), harvest: Apr 1-Apr 30 (DOY 456-485). Very dry winter; GDD controlled by temperature not water.',
+     fao_sow:[319,344], fao_harv:[456,488],
+     chk:{rabi_sow_irr:[308,362], rabi_harvest_doy:[435,502], rabi_gdd0_irr:[1200,2700],
+          rabi_frost_days_0:[0,6], rabi_precip_mm:[10,140], vern_zone:[2,4]}},
+    {name:'Basra_Iraq',       lon:47.8,  lat:30.5,
+     desc:'Irrigated wheat, arid Mesopotamia. FAO sow: Nov 1-Dec 1 (DOY 305-335), harvest: Mar 20-Apr 20 (DOY 444-475). Extremely dry; drought fraction ~100%.',
+     fao_sow:[305,335], fao_harv:[444,478],
+     chk:{rabi_sow_irr:[292,355], rabi_harvest_doy:[418,488], rabi_gdd0_irr:[1400,3200],
+          rabi_precip_mm:[15,160], rabi_drought_frac_pct:[55,100], vern_zone:[2,3]}},
+
+    // ── Wheat cool fringe: Turkey/Yangtze/Louisiana vernalizing systems ──
+    {name:'Konya_Turkey',     lon:32.5,  lat:37.9,
+     desc:'Dryland winter wheat, Anatolian plateau. FAO sow: Oct 1-Nov 10 (DOY 274-314), harvest: Jun 10-Jul 15 (DOY 526-561). Long cold winter; strong vernalization.',
+     fao_sow:[274,314], fao_harv:[526,561],
+     chk:{rabi_sow_irr:[262,325], rabi_harvest_doy:[498,575], rabi_gdd0_irr:[1100,2900],
+          rabi_frost_days_0:[20,95], rabi_frost_days_m2:[5,55], rabi_precip_mm:[140,520],
+          vern_zone:[2,3]}},
+    {name:'Yangtze_China',    lon:120.0, lat:30.5,
+     desc:'Winter wheat, Yangtze valley. FAO sow: Oct 20-Nov 20 (DOY 293-324), harvest: May 15-Jun 15 (DOY 500-531). Humid subtropical; frost risk in Jan-Feb.',
+     fao_sow:[293,324], fao_harv:[500,535],
+     chk:{rabi_sow_irr:[282,340], rabi_harvest_doy:[475,552], rabi_gdd0_irr:[1100,2700],
+          rabi_frost_days_0:[8,65], rabi_precip_mm:[80,450], vern_zone:[2,3],
+          kharif_gdd10_irr:[2500,5000]}},
+    {name:'Louisiana_USA',    lon:-90.5, lat:29.9,
+     desc:'Soft red winter wheat, Gulf Coast. FAO sow: Oct 20-Nov 20 (DOY 293-324), harvest: May 15-Jun 15 (DOY 500-531). Warm humid winter; high precipitation.',
+     fao_sow:[293,324], fao_harv:[498,535],
+     chk:{rabi_sow_irr:[282,345], rabi_harvest_doy:[478,550], rabi_gdd0_irr:[1400,3600],
+          rabi_frost_days_0:[0,22], rabi_precip_mm:[200,750], vern_zone:[3,4],
+          kharif_gdd10_irr:[1500,3800]}},
+
+    // ── Warm rabi / rice systems ──
+    {name:'Bangladesh',       lon:90.4,  lat:23.7,
+     desc:'Boro (winter) rice, Bangladesh. FAO sow: Nov 1-Dec 15 (DOY 305-349), harvest: Mar 1-Apr 10 (DOY 425-465). Rice is dominant rabi crop; GDD10 is the viability metric.',
+     fao_sow:[305,349], fao_harv:[425,468],
+     chk:{rabi_sow_irr:[292,362], rabi_harvest_doy:[415,480], rabi_gdd10_irr:[600,2400],
+          kharif_precip_mm:[1000,3700], kharif_gdd10_irr:[1800,4200],
+          kharif_rice_rain_yield_mult_pct:[45,100], vern_zone:[3,4]}},
+    {name:'Mekong_Delta',     lon:105.8, lat:10.0,
+     desc:'Triple-crop rice, Mekong Delta. Tropical; no true rabi wheat. Rabi GDD10 is warm-season thermal budget. Double-crop gate should fire.',
+     fao_sow:null, fao_harv:null,
+     chk:{rabi_gdd10_irr:[1400,3200], kharif_gdd10_irr:[2500,5500],
+          kharif_precip_mm:[800,3500], vern_zone:[4,4]}},
+    {name:'Guangzhou_China',  lon:113.3, lat:23.1,
+     desc:'Double rice, Pearl River Delta. Traditional system: first crop Apr-Jul, second crop Aug-Nov (both in kharif window). Winter rabi is wheat/rapeseed.',
+     fao_sow:null, fao_harv:null,
+     chk:{rabi_gdd0_irr:[900,2800], kharif_gdd10_irr:[2000,5000],
+          kharif_precip_mm:[600,2500], vern_zone:[3,4]}}
+  ],
+
+  SH: [
+    // ── SH wheat core: Pampas and Mediterranean belts ──
+    {name:'Pampas_Argentina', lon:-63.0, lat:-34.0,
+     desc:'Winter wheat, Argentine Pampas. FAO sow: Apr-Jun (DOY 91-181), harvest: Oct-Nov (DOY 274-319). Mild temperate winters; good radiation.',
+     fao_sow:[74,160], fao_harv:[252,332],
+     chk:{rabi_sow_irr:[55,145], rabi_harvest_doy:[248,365], rabi_gdd0_irr:[750,2900],
+          rabi_frost_days_0:[0,28], rabi_yield_mult_irr_pct:[30,100], vern_zone:[2,4],
+          kharif_gdd10_irr:[1200,4200]}},
+    {name:'Western_Cape_SA',  lon:18.9,  lat:-33.5,
+     desc:'Mediterranean wheat, Western Cape. FAO sow: May-Jun (DOY 121-166), harvest: Oct-Nov (DOY 274-319). Winter rain, spring dry-down forces moisture termination of rainfed.',
+     fao_sow:[100,168], fao_harv:[259,335],
+     chk:{rabi_sow_irr:[62,135], rabi_harvest_doy:[240,365], rabi_gdd0_irr:[750,2400],
+          rabi_precip_mm:[120,650], vern_zone:[2,3]}},
+    {name:'S_Australia',      lon:138.0, lat:-32.0,
+     desc:'Dryland wheat, S. Australia. FAO sow: Apr-Jun (DOY 91-181), harvest: Oct-Dec (DOY 274-365). Dry spring heat can cause early termination OR long seasons if heat delayed.',
+     fao_sow:[88,168], fao_harv:[259,365],
+     chk:{rabi_sow_irr:[72,158], rabi_harvest_doy:[240,365], rabi_gdd0_irr:[750,5200],
+          rabi_precip_mm:[75,465], rabi_drought_frac_pct:[20,100], vern_zone:[3,4]}},
+    {name:'Chile_Central',    lon:-71.0, lat:-34.5,
+     desc:'Mediterranean wheat, central Chile. FAO sow: May-Jun (DOY 121-166), harvest: Oct-Nov (DOY 274-319).',
+     fao_sow:[105,168], fao_harv:[255,330],
+     chk:{rabi_sow_irr:[62,138], rabi_harvest_doy:[240,362], rabi_gdd0_irr:[750,2600],
+          vern_zone:[2,4]}}
+  ]
+};
+
+var currentPixels = ALL_REF_PIXELS[HEMISPHERE];
+
+// Build FeatureCollection for batch sampling
+var refFC = ee.FeatureCollection(currentPixels.map(function(p) {
+  return ee.Feature(ee.Geometry.Point([p.lon, p.lat]), {site: p.name});
+}));
+
+// Sample all bands at all reference points in one server call
+var sampled = img.sampleRegions({
+  collection: refFC,
+  scale: 11132,
+  tileScale: 4,
+  geometries: false
+});
+print('── C: Reference pixel values ──');
+print('(full band table — use inspector or expand below)', sampled);
+
+// Compact chart: key timing and GDD bands across all reference pixels
+var CHART_BANDS = [
+  'rabi_sow_irr', 'rabi_harvest_doy', 'rabi_gdd0_irr', 'rabi_gdd10_irr',
+  'rabi_yield_mult_irr_pct', 'kharif_gdd10_irr', 'kharif_precip_mm', 'vern_zone'
+];
+if (IS_V11) CHART_BANDS = CHART_BANDS.concat(['kharif_gdd10_pp_irr', 'kharif_gdd10_pp_irr_2nd']);
+
+print(ui.Chart.feature.byFeature({
+  features: sampled.select(CHART_BANDS),
+  xProperty: 'site',
+  yProperties: CHART_BANDS
+}).setChartType('Table').setOptions({title: 'Reference pixel values — key bands'}));
+
+// ================================================================
+// SECTION D — PASS/FAIL + FAO CALENDAR COMPARISON
+// ================================================================
+sampled.evaluate(function(fc) {
+  print('');
+  print('══════════════════════════════════════════════════════════════');
+  print('  SECTION D: Crop-system PASS/FAIL + FAO calendar benchmarks');
+  print('══════════════════════════════════════════════════════════════');
+
+  if (!fc || !fc.features || fc.features.length === 0) {
+    print('[ERROR] No features returned — pixels may be masked or outside RABI_MASK.');
+    return;
+  }
+
+  var pass = 0, fail = 0, warn = 0;
+
+  fc.features.forEach(function(feat) {
+    var v    = feat.properties;
+    var name = v['site'];
+    var meta = null;
+    currentPixels.forEach(function(p) { if (p.name === name) meta = p; });
+    if (!meta) return;
+
+    print('');
+    print('▶ ' + name + ' — ' + meta.desc);
+
+    // Internal consistency checks (always run)
+    var matLeHarv = (v['rabi_maturity_doy'] !== null) && (v['rabi_harvest_doy'] !== null)
+      && (v['rabi_maturity_doy'] <= v['rabi_harvest_doy']);
+    var rainLeIrrGDD0 = (v['rabi_gdd0_rain'] !== null) && (v['rabi_gdd0_irr'] !== null)
+      && (v['rabi_gdd0_rain'] <= v['rabi_gdd0_irr']);
+    var rainLeIrrGDD10 = (v['rabi_gdd10_rain'] !== null) && (v['rabi_gdd10_irr'] !== null)
+      && (v['rabi_gdd10_rain'] <= v['rabi_gdd10_irr']);
+    var sowRainGeSowIrr = (v['rabi_sow_rain'] !== null) && (v['rabi_sow_irr'] !== null)
+      && (v['rabi_sow_rain'] >= v['rabi_sow_irr']);
+    var kRainGeKStart = (v['kharif_rain_start_doy'] !== null) && (v['kharif_start_doy'] !== null)
+      && (v['kharif_rain_start_doy'] >= v['kharif_start_doy']);
+
+    function tag(b) { return b ? '[PASS]' : '[FAIL]'; }
+    if (!matLeHarv)     { print(tag(matLeHarv)  + ' maturity ≤ harvest: mat=' + v['rabi_maturity_doy'] + ', harv=' + v['rabi_harvest_doy']); fail++; }
+    else { pass++; }
+    if (!rainLeIrrGDD0) { print(tag(rainLeIrrGDD0) + ' gdd0_rain ≤ gdd0_irr: rain=' + Math.round(v['rabi_gdd0_rain']) + ', irr=' + Math.round(v['rabi_gdd0_irr'])); fail++; }
+    else { pass++; }
+    if (!sowRainGeSowIrr) { print(tag(sowRainGeSowIrr) + ' sow_rain ≥ sow_irr: rain=' + v['rabi_sow_rain'] + ', irr=' + v['rabi_sow_irr']); fail++; }
+    else { pass++; }
+
+    // FAO calendar comparison
+    if (meta.fao_sow) {
+      var sowOK   = v['rabi_sow_irr'] >= meta.fao_sow[0] - 15 && v['rabi_sow_irr'] <= meta.fao_sow[1] + 15;
+      print((sowOK ? '[PASS]' : '[WARN]') + ' sow_irr = ' + v['rabi_sow_irr']
+        + '  FAO window: ' + meta.fao_sow[0] + '–' + meta.fao_sow[1] + ' (±15 d tolerance)');
+      if (!sowOK) warn++;
+    }
+    if (meta.fao_harv) {
+      var harvOK  = v['rabi_harvest_doy'] >= meta.fao_harv[0] - 20 && v['rabi_harvest_doy'] <= meta.fao_harv[1] + 20;
+      print((harvOK ? '[PASS]' : '[WARN]') + ' harvest_doy = ' + v['rabi_harvest_doy']
+        + '  FAO window: ' + meta.fao_harv[0] + '–' + meta.fao_harv[1] + ' (±20 d tolerance)');
+      if (!harvOK) warn++;
+    }
+
+    // Band range checks
+    Object.keys(meta.chk).forEach(function(band) {
+      var lo = meta.chk[band][0], hi = meta.chk[band][1];
+      var val = v[band];
+      if (val === null || val === undefined) {
+        print('[WARN] ' + band + ' = null (masked or band absent)'); warn++; return;
+      }
+      var ok = (val >= lo && val <= hi);
+      if (ok) { pass++; } else { fail++; }
+      print((ok ? '[PASS]' : '[FAIL]') + ' ' + band + ' = ' + Math.round(val)
+        + '  [' + lo + '–' + hi + ']');
+    });
+
+    // Derived diagnostics (contextual, not hard PASS/FAIL)
+    if (v['rabi_gdd0_irr'] !== null) {
+      print('  » rabi_gdd0_irr ≥ 1600 (wheat viable)? '
+        + (v['rabi_gdd0_irr'] >= 1600 ? 'YES' : 'NO — marginal or rice/barley system'));
+      print('  » rabi_gdd10_irr ≥ 1800 (rice in rabi viable)? '
+        + (v['rabi_gdd10_irr'] >= 1800 ? 'YES' : 'NO — too cold for traditional rice in rabi'));
+    }
+    if (v['kharif_gdd10_irr'] !== null) {
+      print('  » kharif_gdd10_irr ≥ 1800 (rice/maize viable in kharif)? '
+        + (v['kharif_gdd10_irr'] >= 1800 ? 'YES' : 'NO — marginal'));
+      print('  » kharif_gdd10_irr ≥ 3200 (double rice gate)? '
+        + (v['kharif_gdd10_irr'] >= 3200 ? 'YES — 2nd crop computation would fire' : 'NO — gate not met'));
+    }
+    if (IS_V11 && v['kharif_gdd10_pp_irr'] !== null && v['kharif_gdd10_irr'] > 0) {
+      var ratio = v['kharif_gdd10_pp_irr'] / v['kharif_gdd10_irr'];
+      print('  » ppMod ratio (kharif) = ' + ratio.toFixed(3)
+        + ' — rice DL suppression at this latitude: ' + Math.round((1-ratio)*100) + '%');
+    }
+    if (IS_V11 && v['kharif_gdd10_pp_irr_2nd'] !== null) {
+      print('  » kharif_gdd10_pp_irr_2nd = ' + Math.round(v['kharif_gdd10_pp_irr_2nd'])
+        + (v['kharif_gdd10_pp_irr_2nd'] > 900 ? ' — 2nd rice crop viable' : ' — insufficient for 2nd crop'));
+    }
+    if (v['rabi_gdd0_irr'] !== null && v['rabi_gdd0_rain'] !== null) {
+      print('  » irr−rain GDD0 gap = ' + Math.round(v['rabi_gdd0_irr'] - v['rabi_gdd0_rain'])
+        + ' (large = moisture-limited; small = rainfed adequate)');
+    }
+    var kharifLen = (v['kharif_end_doy'] !== null && v['kharif_start_doy'] !== null)
+      ? Math.round(v['kharif_end_doy'] - v['kharif_start_doy']) : null;
+    if (kharifLen !== null) {
+      print('  » kharif window = ' + kharifLen + ' d  ('
+        + v['kharif_start_doy'] + '–' + v['kharif_end_doy'] + ')');
+    }
+  });
+
+  print('');
+  print('══ D summary: PASS=' + pass + '  FAIL=' + fail + '  WARN=' + warn + ' ══');
+});
+
+// ================================================================
+// SECTION E — CROSS-BAND SPATIAL CONSISTENCY (image-level)
+// ================================================================
+// Each flag is 1 where the condition FAILS (0=consistent). Reduce to
+// pixel count over the sanity geometry at coarse scale (55km = fast).
+print('');
+print('── E: Cross-band spatial consistency ──');
+
+var flags = {
+  'maturity_gt_harvest':   img.select('rabi_maturity_doy').gt(img.select('rabi_harvest_doy')),
+  'rain_sow_lt_irr_sow':   img.select('rabi_sow_rain').lt(img.select('rabi_sow_irr')),
+  'rain_gdd0_gt_irr_gdd0': img.select('rabi_gdd0_rain').gt(img.select('rabi_gdd0_irr')),
+  'rain_gdd10_gt_irr_gdd10':img.select('rabi_gdd10_rain').gt(img.select('rabi_gdd10_irr')),
+  'krain_before_kstart':   img.select('kharif_rain_start_doy').lt(img.select('kharif_start_doy')),
+  'season_len_mismatch':   img.select('rabi_season_len_irr').subtract(
+                             img.select('rabi_harvest_doy').subtract(img.select('rabi_sow_irr'))).abs().gt(2),
+  'harvest_lt_sow':        img.select('rabi_harvest_doy').lt(img.select('rabi_sow_irr'))
+};
+
+// v1.1 specific consistency
+if (IS_V11) {
+  flags['pp_irr_exceeds_irr']   = img.select('kharif_gdd10_pp_irr').gt(img.select('kharif_gdd10_irr').multiply(1.01));
+  flags['2nd_exceeds_pp_total'] = img.select('kharif_gdd10_pp_irr_2nd').gt(img.select('kharif_gdd10_pp_irr').multiply(1.01));
+  flags['2nd_fires_below_gate'] = img.select('kharif_gdd10_pp_irr_2nd').gt(0)
+    .and(img.select('kharif_gdd10_irr').lt(3200));
+}
+
+// Combine all flags and reduce to sum (failure pixel count)
+var flagImg = ee.Image(Object.keys(flags).map(function(k) { return flags[k].rename(k); }))
+  .unmask(0).toByte();
+
+flagImg.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: SANITY_GEOM,
+  scale: 55600,
+  maxPixels: 1e9
+}).evaluate(function(r) {
+  print('Failure pixel counts (0 = fully consistent):');
+  Object.keys(r).forEach(function(k) {
+    var n = r[k];
+    print((n === 0 ? '[PASS]' : '[FAIL]') + ' ' + k + ' — ' + n + ' pixels');
+  });
+});
+
+// ================================================================
+// SECTION F — GLOBAL DISTRIBUTION PERCENTILES
+// ================================================================
+// Key bands at P5/P25/P50/P75/P95 across the analysis belt.
+// Compares distributional shape against expected agronomic ranges.
+print('');
+print('── F: Global distribution percentiles (p5/p25/p50/p75/p95) ──');
+
+var DIST_BANDS = [
+  'rabi_sow_irr', 'rabi_season_len_irr', 'rabi_gdd0_irr',
+  'rabi_gdd10_irr', 'rabi_yield_mult_irr_pct',
+  'rabi_drought_frac_pct', 'rabi_frost_days_0',
+  'kharif_gdd10_irr', 'kharif_precip_mm', 'ptq_factor'
+];
+if (IS_V11) DIST_BANDS = DIST_BANDS.concat(['kharif_gdd10_pp_irr', 'kharif_gdd10_pp_irr_2nd']);
+
+img.select(DIST_BANDS).reduceRegion({
+  reducer: ee.Reducer.percentile([5, 25, 50, 75, 95]),
+  geometry: SANITY_GEOM,
+  scale: 55600,
+  maxPixels: 1e9
+}).evaluate(function(r) {
+  DIST_BANDS.forEach(function(b) {
+    var p5=r[b+'_p5'], p25=r[b+'_p25'], p50=r[b+'_p50'], p75=r[b+'_p75'], p95=r[b+'_p95'];
+    if (p50 === null || p50 === undefined) { print('[skip] ' + b + ' — no data'); return; }
+    print(b + ':  p5=' + Math.round(p5) + '  p25=' + Math.round(p25)
+      + '  p50=' + Math.round(p50) + '  p75=' + Math.round(p75) + '  p95=' + Math.round(p95));
+  });
+  // Agronomic interpretations
+  if (r['rabi_gdd0_irr_p50'] !== null) {
+    print('» Median rabi_gdd0_irr (' + Math.round(r['rabi_gdd0_irr_p50']) + ') '
+      + (r['rabi_gdd0_irr_p50'] >= 1600 ? '≥ 1600 — median pixel is wheat-viable' : '< 1600 — median pixel is marginal for wheat'));
+    print('» rabi_gdd0_irr p95 (' + Math.round(r['rabi_gdd0_irr_p95']) + ') — cap on very warm/long-season pixels');
+  }
+  if (r['kharif_precip_mm_p50'] !== null) {
+    print('» Median kharif_precip (' + Math.round(r['kharif_precip_mm_p50']) + ' mm) '
+      + (r['kharif_precip_mm_p50'] >= 600 ? '≥ 600 mm — median pixel meets rainfed rice precip gate' : '< 600 mm — median pixel does not meet rice precip gate'));
+  }
+  if (IS_V11 && r['kharif_gdd10_pp_irr_2nd_p75'] !== null) {
+    print('» kharif_gdd10_pp_irr_2nd p75 = ' + Math.round(r['kharif_gdd10_pp_irr_2nd_p75'])
+      + ' (> 0 means top quartile of pixels support double rice)');
+  }
+});
+
+// ================================================================
+// SECTION G — ppMod EFFECT DIAGNOSTIC [v1.1 only]
+// Quantifies rice photoperiod suppression as a function of latitude.
+// Expected: ppRatio ≈ 1.0 at ≤ 20°N, declining to ~0.70-0.75 at 40°N.
+// Suppression > 50% at any latitude indicates model parameters need review.
+// ================================================================
+if (IS_V11) {
+  print('');
+  print('── G: ppMod effect diagnostic (v1.1) ──');
+  print('Expected ppRatio ≈ 1.00 at ≤20°N; ≈0.90 at 30°N; ≈0.75-0.80 at 40°N');
+
+  var ppRatioImg = img.select('kharif_gdd10_pp_irr')
+    .divide(img.select('kharif_gdd10_irr').max(1))
+    .clamp(0, 1)
+    .rename('ppmod_ratio');
+
+  // Sample ppRatio at 5° latitude intervals along a longitude transect (80°E for NH; 20°E for SH)
+  var transectLon = HEMISPHERE === 'NH' ? 80 : 25;
+  var latSteps = HEMISPHERE === 'NH'
+    ? [5, 10, 15, 20, 25, 30, 35, 40]
+    : [-5, -10, -15, -20, -25, -30, -35];
+  var transectPts = ee.FeatureCollection(latSteps.map(function(lat) {
+    return ee.Feature(ee.Geometry.Point([transectLon, lat]), {lat: lat});
+  }));
+  var ppSampled = ppRatioImg.sampleRegions({collection: transectPts, scale: 55600, tileScale: 4});
+
+  ppSampled.evaluate(function(fc) {
+    if (!fc || !fc.features.length) { print('[WARN] No ppMod samples returned'); return; }
+    print('Latitude transect ppMod ratio (rice DL suppression in kharif):');
+    fc.features.forEach(function(f) {
+      var lat  = f.properties['lat'];
+      var r    = f.properties['ppmod_ratio'];
+      if (r === null || r === undefined) { print('  lat=' + lat + '°  → masked'); return; }
+      var pct  = Math.round((1 - r) * 100);
+      var bar  = new Array(Math.round(pct / 5) + 1).join('█');
+      var ok   = r >= 0.5;
+      print((ok ? '  ' : '[W] ') + 'lat=' + (lat > 0 ? '+' : '') + lat + '°  ratio='
+        + r.toFixed(3) + '  suppression=' + pct + '%  ' + bar);
+    });
+    print('(Suppression > 50% at any latitude warrants parameter review)');
+  });
+
+  // Also print global mean ppMod ratio to quantify overall suppression
+  ppRatioImg.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: SANITY_GEOM,
+    scale: 55600,
+    maxPixels: 1e9
+  }).evaluate(function(r) {
+    if (r && r['ppmod_ratio'] !== null) {
+      print('Global mean ppMod ratio over belt: ' + r['ppmod_ratio'].toFixed(3)
+        + ' — avg ' + Math.round((1 - r['ppmod_ratio']) * 100) + '% rice GDD suppression in kharif');
+    }
+  });
+}
+
+// ================================================================
+// SECTION H — DOUBLE-CROP ZONE VALIDATION [v1.1 only]
+// Known double-rice zones (pre-industrial): Mekong Delta (10°N),
+// Pearl River Delta (23°N), Kerala/Tamil Nadu (10°N), Bangladesh boro+aman.
+// Expected: kharif_gdd10_pp_irr_2nd > 900 in these regions; ≈0 at >35°N.
+// ================================================================
+if (IS_V11) {
+  print('');
+  print('── H: Double-crop zone validation (v1.1) ──');
+
+  var doubleCropImg  = img.select('kharif_gdd10_pp_irr_2nd');
+  var doubleBinary   = doubleCropImg.gt(900);  // > 900 GDD10 = can sustain a 2nd rice crop
+
+  // Area of double-crop potential zone (km²)
+  var doubleCropArea = doubleBinary.multiply(ee.Image.pixelArea()).divide(1e6)
+    .reduceRegion({reducer: ee.Reducer.sum(), geometry: SANITY_GEOM, scale: 55600, maxPixels: 1e9});
+  doubleCropArea.evaluate(function(r) {
+    var v = r[Object.keys(r)[0]];
+    print('Area with kharif_gdd10_pp_irr_2nd > 900 GDD10: '
+      + (v ? Math.round(v).toLocaleString() : 'n/a') + ' km²');
+    print('(For reference: Mekong+Pearl+Kerala+Bangladesh rice zones ≈ 200,000-500,000 km²)');
+  });
+
+  // Distribution of 2nd crop GDD10 in pixels where gate fired
+  doubleCropImg.updateMask(doubleCropImg.gt(0))
+    .reduceRegion({
+      reducer: ee.Reducer.percentile([25, 50, 75, 95]),
+      geometry: SANITY_GEOM,
+      scale: 55600,
+      maxPixels: 1e9
+    }).evaluate(function(r) {
+      if (!r || r['kharif_gdd10_pp_irr_2nd_p50'] === null) {
+        print('[INFO] No pixels with kharif_gdd10_pp_irr_2nd > 0 in this geometry');
+        return;
+      }
+      print('2nd crop GDD10 distribution (where gate fired):');
+      print('  p25=' + Math.round(r['kharif_gdd10_pp_irr_2nd_p25'])
+        + '  p50=' + Math.round(r['kharif_gdd10_pp_irr_2nd_p50'])
+        + '  p75=' + Math.round(r['kharif_gdd10_pp_irr_2nd_p75'])
+        + '  p95=' + Math.round(r['kharif_gdd10_pp_irr_2nd_p95']));
+      print('  » p50 ≥ 1800? ' + (r['kharif_gdd10_pp_irr_2nd_p50'] >= 1800
+        ? 'YES — median double-crop pixel can support a full second rice crop'
+        : 'NO — median double-crop pixel is marginal (not quite 1800 GDD10)'));
+    });
+
+  // Check specific known double-rice pixels
+  var doublePts = ee.FeatureCollection([
+    ee.Feature(ee.Geometry.Point([105.8,10.0]), {site:'Mekong_Delta'}),
+    ee.Feature(ee.Geometry.Point([113.3,23.1]), {site:'Pearl_River_Delta'}),
+    ee.Feature(ee.Geometry.Point([80.0,10.5]),  {site:'Kerala_India'}),
+    ee.Feature(ee.Geometry.Point([90.4,23.7]),  {site:'Bangladesh_boro'})
+  ]);
+  img.select(['kharif_gdd10_irr','kharif_gdd10_pp_irr','kharif_gdd10_pp_irr_2nd'])
+    .sampleRegions({collection: doublePts, scale: 11132, tileScale: 4})
+    .evaluate(function(fc) {
+      if (!fc || !fc.features.length) { print('[WARN] Double-crop point samples empty'); return; }
+      print('Known double-rice zone spot checks:');
+      fc.features.forEach(function(f) {
+        var p = f.properties;
+        var gateOK = p['kharif_gdd10_irr'] >= 3200;
+        var viable = p['kharif_gdd10_pp_irr_2nd'] > 900;
+        print('  ' + p['site'] + ': gdd10_irr=' + Math.round(p['kharif_gdd10_irr'])
+          + ' [gate ' + (gateOK?'FIRES':'miss') + ']'
+          + '  pp_irr=' + Math.round(p['kharif_gdd10_pp_irr'])
+          + '  2nd_crop=' + Math.round(p['kharif_gdd10_pp_irr_2nd'])
+          + ' [' + (viable?'viable':'marginal') + ']');
+      });
+    });
+}
+
+// ================================================================
+// SECTION I — 30-YEAR TIME-SERIES AT ANCHOR PIXEL [optional]
+// Set LOAD_COLLECTION = true to activate. Loads all 30 years and
+// plots rabi_sow_irr, rabi_gdd0_irr, rabi_yield_mult_irr_pct at
+// the anchor pixel to show inter-annual variability and trends.
+// ================================================================
+if (LOAD_COLLECTION) {
+  print('');
+  print('── I: 30-year time-series (loading collection — may be slow) ──');
+
+  var anchorPt   = HEMISPHERE === 'NH'
+    ? ee.Geometry.Point([75.8, 30.9])   // Punjab India
+    : ee.Geometry.Point([-63.0, -34.0]); // Pampas Argentina
+  var anchorName = HEMISPHERE === 'NH' ? 'Punjab India (75.8°E, 30.9°N)' : 'Pampas Argentina (-63°W, -34°S)';
+
+  var SERIES_BANDS = ['rabi_sow_irr', 'rabi_gdd0_irr', 'rabi_yield_mult_irr_pct',
+                      'kharif_gdd10_irr', 'rabi_drought_frac_pct'];
+  if (IS_V11) SERIES_BANDS.push('kharif_gdd10_pp_irr');
+
+  var collection = ee.ImageCollection(COLLECTION_ID);
+  var timeSeries = collection.map(function(img2) {
+    return img2.select(SERIES_BANDS).reduceRegion({
+      reducer: ee.Reducer.first(),
+      geometry: anchorPt,
+      scale: 11132
+    }).set('year', img2.get('year'));
+  });
+
+  var tsFC = ee.FeatureCollection(timeSeries.map(function(d) {
+    return ee.Feature(null, d);
+  }));
+
+  print(ui.Chart.feature.byFeature(tsFC, 'year', ['rabi_gdd0_irr', 'kharif_gdd10_irr'])
+    .setChartType('LineChart')
+    .setOptions({title: 'GDD0 rabi vs. GDD10 kharif — ' + anchorName,
+                 vAxis: {title: 'GDD'}, hAxis: {title: 'Year'}}));
+
+  print(ui.Chart.feature.byFeature(tsFC, 'year', ['rabi_yield_mult_irr_pct', 'rabi_drought_frac_pct'])
+    .setChartType('LineChart')
+    .setOptions({title: 'Rabi yield mult IRR & drought fraction — ' + anchorName,
+                 vAxis: {title: '%', minValue: 0, maxValue: 100}}));
+
+  print(ui.Chart.feature.byFeature(tsFC, 'year', ['rabi_sow_irr'])
+    .setChartType('LineChart')
+    .setOptions({title: 'Rabi sow DOY inter-annual variability — ' + anchorName,
+                 vAxis: {title: 'DOY'}}));
+}
+
+print('');
+print('▶ Validator complete. Map layers loaded. Async results appear above as they resolve.');
+print('  ASSET_VERSION=' + ASSET_VERSION + '  HEMISPHERE=' + HEMISPHERE + '  YEAR=' + YEAR);
