@@ -1,6 +1,6 @@
 // ================================================================
-// RABI DIAGNOSTIC VALIDATOR v2.0
-// Compatible with asset v1.0 (37 bands) and v1.1 (41 bands).
+// RABI DIAGNOSTIC VALIDATOR v2.1
+// Compatible with asset v1.0 (37 bands), v1.1 (41 bands), and v1.2 (41 bands).
 //
 // Sections:
 //   A — Band presence
@@ -20,7 +20,9 @@ var YEAR          = 1965;
 var ASSET_VERSION = 'v12';  // 'v1' for v1.0  |  'v11' for v1.1
 var LOAD_COLLECTION = false; // true → Section I time-series (slow)
 
-var IS_V11 = (ASSET_VERSION === 'v11');
+var IS_V11 = (ASSET_VERSION === 'v11' || ASSET_VERSION === 'v12');
+// v1.2 lowered the double-crop GDD gate from 3200 to 2800
+var DOUBLE_CROP_MIN_GDD_VAL = (ASSET_VERSION === 'v12') ? 2800 : 3200;
 
 // ── ASSET LOAD ───────────────────────────────────────────────────
 var HEMI_SUFFIX      = HEMISPHERE === 'NH' ? 'North' : 'South';
@@ -257,7 +259,7 @@ var CHART_BANDS = [
 if (IS_V11) CHART_BANDS = CHART_BANDS.concat(['kharif_gdd10_pp_irr', 'kharif_gdd10_pp_irr_2nd']);
 
 print(ui.Chart.feature.byFeature({
-  features: sampled.select(CHART_BANDS),
+  features: sampled.select(['site'].concat(CHART_BANDS)),
   xProperty: 'site',
   yProperties: CHART_BANDS
 }).setChartType('Table').setOptions({title: 'Reference pixel values — key bands'}));
@@ -345,8 +347,8 @@ sampled.evaluate(function(fc) {
     if (v['kharif_gdd10_irr'] !== null) {
       print('  » kharif_gdd10_irr ≥ 1800 (rice/maize viable in kharif)? '
         + (v['kharif_gdd10_irr'] >= 1800 ? 'YES' : 'NO — marginal'));
-      print('  » kharif_gdd10_irr ≥ 3200 (double rice gate)? '
-        + (v['kharif_gdd10_irr'] >= 3200 ? 'YES — 2nd crop computation would fire' : 'NO — gate not met'));
+      print('  » kharif_gdd10_irr ≥ ' + DOUBLE_CROP_MIN_GDD_VAL + ' (double rice gate)? '
+        + (v['kharif_gdd10_irr'] >= DOUBLE_CROP_MIN_GDD_VAL ? 'YES — 2nd crop computation would fire' : 'NO — gate not met'));
     }
     if (IS_V11 && v['kharif_gdd10_pp_irr'] !== null && v['kharif_gdd10_irr'] > 0) {
       var ratio = v['kharif_gdd10_pp_irr'] / v['kharif_gdd10_irr'];
@@ -397,7 +399,7 @@ if (IS_V11) {
   flags['pp_irr_exceeds_irr']   = img.select('kharif_gdd10_pp_irr').gt(img.select('kharif_gdd10_irr').multiply(1.01));
   flags['2nd_exceeds_pp_total'] = img.select('kharif_gdd10_pp_irr_2nd').gt(img.select('kharif_gdd10_pp_irr').multiply(1.01));
   flags['2nd_fires_below_gate'] = img.select('kharif_gdd10_pp_irr_2nd').gt(0)
-    .and(img.select('kharif_gdd10_irr').lt(3200));
+    .and(img.select('kharif_gdd10_irr').lt(DOUBLE_CROP_MIN_GDD_VAL));
 }
 
 // Combine all flags and reduce to sum (failure pixel count)
@@ -576,7 +578,7 @@ if (IS_V11) {
       print('Known double-rice zone spot checks:');
       fc.features.forEach(function(f) {
         var p = f.properties;
-        var gateOK = p['kharif_gdd10_irr'] >= 3200;
+        var gateOK = p['kharif_gdd10_irr'] >= DOUBLE_CROP_MIN_GDD_VAL;
         var viable = p['kharif_gdd10_pp_irr_2nd'] > 900;
         print('  ' + p['site'] + ': gdd10_irr=' + Math.round(p['kharif_gdd10_irr'])
           + ' [gate ' + (gateOK?'FIRES':'miss') + ']'
