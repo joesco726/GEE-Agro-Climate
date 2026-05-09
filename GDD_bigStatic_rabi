@@ -1,20 +1,32 @@
 // ======================================================
-// RABI PRECOMPUTE v1.2 — Mask + Double-Crop Gate Fixes
-// Changes from v1.1:
-// • vernZone sourced from vernalization_static_v3_PL (correct 1–4 classification)
-//   instead of computed inline from crop-static b1. Inline computation assigned
-//   very cold pixels (soil ≤ 0°C) to zone 4 alongside tropical pixels, causing
-//   cold-continental pixels (Konya-type) to pass the rabi mask incorrectly.
-//   Those pixels belong to the winter-spring script (zone 1), not this one.
-// • RABI_MASK gains meanMinSoilC.gt(0): crop-static min-C above zero required.
-//   Cleanly excludes frozen-soil pixels regardless of vern_zone classification.
-// • DOUBLE_CROP_MIN_GDD: 3200 → 2800 (Guangzhou-type Champa rice systems at 3085
-//   were just below gate; 2800 is agronomically justified for fast-maturing varieties).
-// • DOUBLE_CROP_PRECIP_MM (new, 900 mm): precip gate applied to _rain_2nd only.
-//   _irr_2nd remains thermally gated — irrigated double-rice potential in arid
-//   systems (Sind, Basra) is historically valid and should remain visible.
-// • All v1.2 logic unchanged (rice ppMod, pass2 structure, output bands 1–41).
-// Total output bands: 41
+// RABI PRECOMPUTE v1.3 — Frost-Safe Sow + Heat-Close Window Framework
+// Changes from v1.2:
+// • Frost-safe sow constraint (F) added: F = safeBegin(wrapped) − HEADING_FRAC ×
+//   HARVEST_FALLBACK_D. actual_sow = max(O, F) where O is the existing climate-
+//   opening (first cool composite). Frost-free sentinel pixels (safeEnd == fallback)
+//   set F = 0 so heat alone drives sowing — prevents NH sentinel (safeBegin = 7 →
+//   wrapped 372) from masking as a real frost constraint.
+// • safeBegin and safeEnd now read from P.CROP_STATIC alongside meanMinSoilC.
+// • SAFE_BEGIN_OFFSET added to HEMI_PARAMS: +365 for NH (safeBegin is raw spring
+//   DOY 7–120; must be shifted into rabi-wrapped DOY range), 0 for SH (safeBegin
+//   DOY 189–280 already sits inside the SH wrapped window).
+// • SAFE_END_FALLBACK added to HEMI_PARAMS: NH 364, SH 181 (the unmask sentinels
+//   from GDD_static_aggr when no limiting days were found — frost-free pixels).
+// • Spring heat-close (W): first 8-day composite in the spring search window with
+//   mean Tmax ≥ RABI_SOW_TMAX_C (28 °C). W is the backward-scheduling anchor.
+//   HEAT_CLOSE_MIN/MAX_DOY added to HEMI_PARAMS to bound the search.
+// • Backward sow (B) = W − HARVEST_FALLBACK_D. Records the ideal irrigated sow
+//   target implied by backward scheduling from the heat close.
+// • Disruption = max(0, actual_sow − B). Captures how many days late the
+//   actual sow is relative to backward-scheduled ideal — proxies inter-annual
+//   schedule disruption from late climate opening or late frost clearance.
+// • kharif_start_doy: changed from maturityDOY + TURNAROUND to
+//   max(maturityDOY, heatCloseW) + TURNAROUND. Neither climate warmth nor crop
+//   maturity alone should drive transplanting — both must be satisfied.
+// • Output grows from 41 → 44 bands (new bands 42–44):
+//   rabi_heat_close_doy, rabi_backward_sow_irr, rabi_disruption_days.
+// • All v1.2 logic and band order 1–41 unchanged (validator-compatible for those bands).
+// Total output bands: 44
 // ======================================================
 
 var startYear = 1951;
@@ -34,7 +46,17 @@ var HEMI_PARAMS = {
     CROP_STATIC: 'projects/thermal-growing-seasons/assets/StaticCropLayerNH_v2',
     GEOMETRY: ee.Geometry.Polygon([[[-180, 0], [180, 0], [180, 42], [-180, 42]]], null, false),
     ASSET_SUFFIX: 'North',
-    PASS2_MIN_DOY: 366
+    PASS2_MIN_DOY: 366,
+    // safeBegin from GDD_static_aggr is raw spring DOY (7–120 = Jan–Apr).
+    // Adding 365 converts it into the rabi-wrapped DOY system (372–485).
+    SAFE_BEGIN_OFFSET: 365,
+    // GDD_static_aggr unmasks safeEnd to 364 when no limiting days are found
+    // (frost-free pixel). Used to gate the frost-safe sow constraint.
+    SAFE_END_FALLBACK: 364,
+    // Spring search window for heat-close W (first 8-day mean Tmax ≥ 28 °C).
+    // Bounded to wrapped Jan-Jun to avoid detecting autumn warm spells.
+    HEAT_CLOSE_MIN_DOY: 398,   // ~Feb 2 wrapped (DOY 33 + 365)
+    HEAT_CLOSE_MAX_DOY: 546    // ~Jun 26 wrapped (DOY 181 + 365)
   },
   SH: {
     MONSOON_MIN_DOY: 95,       // ~5 April
@@ -44,7 +66,14 @@ var HEMI_PARAMS = {
     CROP_STATIC: 'projects/thermal-growing-seasons/assets/StaticCropLayerSH_v2',
     GEOMETRY: ee.Geometry.Polygon([[[-180, -40], [180, -40], [180, 0], [-180, 0]]], null, false),
     ASSET_SUFFIX: 'South',
-    PASS2_MIN_DOY: 200
+    PASS2_MIN_DOY: 200,
+    // SH safeBegin is already in the SH rabi window (DOY 189–280 = Jul–Oct).
+    SAFE_BEGIN_OFFSET: 0,
+    // GDD_static_aggr SH unmasks safeEnd to 181 (pivot − 1) for frost-free pixels.
+    SAFE_END_FALLBACK: 181,
+    // Spring search window for heat-close W: austral spring Sep–Dec.
+    HEAT_CLOSE_MIN_DOY: 249,   // ~Sep 6
+    HEAT_CLOSE_MAX_DOY: 361    // ~Dec 27
   }
 };
 var P = HEMI_PARAMS[HEMISPHERE];
@@ -123,7 +152,14 @@ var PTQ_MAX_FACTOR = 1.40;
 // STATIC ASSETS
 // ======================================================
 var statics = ee.Image(P.CROP_STATIC);
-var meanMinSoilC = statics.select('b1').rename('mean_min_soil_c');
+var meanMinSoilC  = statics.select('b1').rename('mean_min_soil_c');
+// safeBegin: last frost/cold-soil limiting day of spring + 7d buffer (30-yr mean).
+//   NH: raw DOY 7–120 (Jan–Apr). Must add SAFE_BEGIN_OFFSET (+365) for wrapped DOY.
+//   SH: raw DOY 189–280 (Jul–Oct). No offset needed.
+// safeEnd: first frost/cold-soil limiting day of autumn − 1d (30-yr mean).
+//   Sentinel safeEnd == SAFE_END_FALLBACK → frost-free pixel; frost constraint non-binding.
+var safeBeginRaw = statics.select('safeBegin');
+var safeEndStatic = statics.select('safeEnd');
 var vernStatic = ee.Image('projects/northern-growing-seasons-v1/assets/vernalization_static_v3_PL');
 var meanVernProgress = vernStatic.select('b3').rename('mean_vernal_progress');
 // Vernalization zone from the dedicated zones asset (1–4 integer classification).
@@ -264,11 +300,27 @@ var computeYearMetrics = function(year) {
     return sowIrr.addBands(sowRain);
   }).reduce(ee.Reducer.min());
 
-  var rabiSowIrr  = sowReduce.select('sow_irr_min')
-    .unmask(P.SOW_FALLBACK_IRR).round().rename('rabi_sow_irr');
+  // O: climate opening signal (first cool composite — temperature threshold alone)
+  var O_irr  = sowReduce.select('sow_irr_min').unmask(P.SOW_FALLBACK_IRR).round();
+  var O_rain = sowReduce.select('sow_rain_min').unmask(O_irr).round();
+
+  // F: frost-safe sow constraint from the winter static.
+  //   F = safeBegin(wrapped) − HEADING_FRAC × HARVEST_FALLBACK_D
+  //   Ensures heading (at HEADING_FRAC of season) falls after the last spring frost.
+  //   Frost-free pixels (safeEnd == SAFE_END_FALLBACK) set F = 0 (non-binding),
+  //   preventing the NH sentinel safeBegin = 7 (→ wrapped 372 → F = 279) from
+  //   falsely constraining heat-driven sowing in tropical/subtropical rabi zones.
+  var safeBeginWrapped = safeBeginRaw.add(P.SAFE_BEGIN_OFFSET);
+  var frostFree = safeEndStatic.eq(P.SAFE_END_FALLBACK);
+  var headingOffset = ee.Image.constant(Math.round(HEADING_FRAC * P.HARVEST_FALLBACK_D));
+  var frostSafeSow = safeBeginWrapped.subtract(headingOffset)
+    .where(frostFree, ee.Image.constant(0))
+    .max(0);
+
+  // actual_sow = max(O, F): climate opening AND frost clearance must both be satisfied.
+  var rabiSowIrr  = O_irr.max(frostSafeSow).round().rename('rabi_sow_irr');
   // Fallback to rabiSowIrr: rain sow can never precede irr sow
-  var rabiSowRain = sowReduce.select('sow_rain_min')
-    .unmask(rabiSowIrr).round().rename('rabi_sow_rain');
+  var rabiSowRain = O_rain.max(frostSafeSow).unmask(rabiSowIrr).round().rename('rabi_sow_rain');
 
   // ── SEASON END ────────────────────────────────────────────────────
   var endReduce = allComposites.map(function(img) {
@@ -287,6 +339,34 @@ var computeYearMetrics = function(year) {
     .unmask(rabiSowIrr.add(200));
   var rabiSeasonLen = rabiHarvestDOY.subtract(rabiSowIrr).max(0);
   var effEndRain = rabiHarvestDOY.min(moistureTermDOY);
+
+  // ── SPRING HEAT CLOSE (W) ─────────────────────────────────────────
+  // First 8-day mean composite in the spring search window with Tmax ≥ 28 °C.
+  // W is the backward-scheduling anchor: the typical date when summer heat
+  // reasserts and the rabi window closes.
+  // Searched in HEAT_CLOSE_MIN_DOY–HEAT_CLOSE_MAX_DOY (wrapped DOY for NH;
+  // raw same-year DOY for SH). Fallback = HEAT_CLOSE_MAX_DOY (no spring
+  // re-warming → allow full spring window; conservative for cool climates).
+  var heatCloseW = allComposites
+    .filter(ee.Filter.gte('start_doy', P.HEAT_CLOSE_MIN_DOY))
+    .filter(ee.Filter.lte('start_doy', P.HEAT_CLOSE_MAX_DOY))
+    .map(function(img) {
+      var doy  = img.select('start_doy');
+      var warm = img.select('tmax_mean_c').gte(RABI_SOW_TMAX_C);
+      return doy.updateMask(warm).rename('heat_close');
+    }).reduce(ee.Reducer.min())
+    .unmask(P.HEAT_CLOSE_MAX_DOY).round().rename('rabi_heat_close_doy');
+
+  // B: backward-scheduled ideal sow = W − expected season length.
+  // Represents the sow date that would allow the crop to reach maturity exactly at W.
+  var backwardSowB = heatCloseW.subtract(P.HARVEST_FALLBACK_D)
+    .rename('rabi_backward_sow_irr');
+
+  // Disruption: days by which actual sow exceeds backward target.
+  // > 0 only when a late climate opening or late frost clearance prevents ideal sowing.
+  // Acts as a per-year proxy for schedule disruption / planting stress.
+  var disruption = rabiSowIrr.subtract(backwardSowB).max(0)
+    .round().rename('rabi_disruption_days');
 
   // ── HEADING DOY ───────────────────────────────────────────────────
   var headingDOY = rabiSowIrr.add(rabiSeasonLen.multiply(HEADING_FRAC).round());
@@ -355,7 +435,12 @@ var computeYearMetrics = function(year) {
     .multiply(rainMaturityWindow.divide(rainSeasonLen.max(1)));
 
   // ── KHARIF TIMING ─────────────────────────────────────────────────
-  var kharifStartDOY = maturityDOY.add(TURNAROUND_DAYS).rename('kharif_start_doy');
+  // Kharif start = max(crop maturity, heat close) + turnaround.
+  // Both constraints must be satisfied: transplanting can't happen before
+  // the rabi crop is off the field (maturityDOY) nor before summer heat
+  // arrives for the warm-season crop (heatCloseW).
+  var kharifStartDOY = maturityDOY.max(heatCloseW).add(TURNAROUND_DAYS)
+    .rename('kharif_start_doy');
   var kharifEndDOY   = rabiSowIrr.add(365).rename('kharif_end_doy');
 
   var kharifRainStart = allComposites
@@ -512,9 +597,10 @@ var computeYearMetrics = function(year) {
   var rabiSeasonLenRain = effEndRain.subtract(rabiSowRain).max(0)
                             .rename('rabi_season_len_rain');
 
-  // ── FINAL OUTPUT — 41 bands ───────────────────────────────────────
+  // ── FINAL OUTPUT — 44 bands ───────────────────────────────────────
   // Bands 1–37: identical to v1.0 (validator-compatible)
-  // Bands 38–41: new rice-ppMod and double-kharif bands
+  // Bands 38–41: rice-ppMod and double-kharif bands (v1.2)
+  // Bands 42–44: spring heat-close, backward sow, disruption days (v1.3)
   return ee.Image([
     // --- Rabi GDD (1–4) ---
     rabiGDD0_irr, rabiGDD0_rain,
@@ -558,18 +644,22 @@ var computeYearMetrics = function(year) {
     // --- NEW: Kharif GDD10 with rice ppMod — 2nd sub-crop (40–41) ---
     // Zero where kharif_gdd10_irr < DOUBLE_CROP_MIN_GDD (gate not met)
     pass2_2nd.select('kharif_gdd10_pp_irr_2nd'),
-    pass2_2nd.select('kharif_gdd10_pp_rain_2nd')
+    pass2_2nd.select('kharif_gdd10_pp_rain_2nd'),
+    // --- NEW v1.3: Spring heat-close, backward sow, disruption (42–44) ---
+    heatCloseW,
+    backwardSowB,
+    disruption
   ]).updateMask(RABI_MASK).set('year', year);
 };
 
 // ======================================================
-// PART 1 — EXPORT YEARLY COLLECTION (v1.2)
+// PART 1 — EXPORT YEARLY COLLECTION (v1.3)
 // ======================================================
 var collectionAssetId =
   'projects/thermal-growing-seasons/assets/RabiMetrics_1951_1980_' +
-  P.ASSET_SUFFIX + '_v12';
-var driveFolder = 'RabiMetrics_v12_' + P.ASSET_SUFFIX;
-var descPrefix  = 'RabiMetrics_v12_' + P.ASSET_SUFFIX + '_';
+  P.ASSET_SUFFIX + '_v13';
+var driveFolder = 'RabiMetrics_v13_' + P.ASSET_SUFFIX;
+var descPrefix  = 'RabiMetrics_v13_' + P.ASSET_SUFFIX + '_';
 var yearsList   = ee.List.sequence(startYear, endYear);
 
 yearsList.evaluate(function(years) {
@@ -591,7 +681,7 @@ yearsList.evaluate(function(years) {
     if (EXPORT_TO_DRIVE) {
       Export.image.toDrive({
         image: img,
-        description: 'RabiDrive_v12_' + P.ASSET_SUFFIX + '_' + yearStr,
+        description: 'RabiDrive_v13_' + P.ASSET_SUFFIX + '_' + yearStr,
         folder: driveFolder,
         fileNamePrefix: descPrefix + yearStr,
         scale: 11132,
@@ -612,8 +702,10 @@ var yearlyCollection = ee.ImageCollection(collectionAssetId);
 // ... (summaryStatic code unchanged from v0.9 / v1.0)
 */
 
-print('Rabi Precompute v1.2 — hemisphere = ' + HEMISPHERE);
+print('Rabi Precompute v1.3 — hemisphere = ' + HEMISPHERE);
+print('Frost-safe sow F = safeBegin(wrapped) − ' + Math.round(HEADING_FRAC * 100) + '% × HARVEST_FALLBACK_D');
+print('actual_sow = max(O_climate, F_frost)  |  kharif_start = max(maturity, heatClose) + turnaround');
 print('Rice ppMod + Method 2 double-kharif gated by DOUBLE_CROP_MIN_GDD = ' + DOUBLE_CROP_MIN_GDD);
 print('Asset: ' + collectionAssetId);
 print('Drive folder: ' + driveFolder);
-print('Output bands: 41 (bands 38-41 are new rice-ppMod and double-kharif bands)');
+print('Output bands: 44 (bands 42-44: rabi_heat_close_doy, rabi_backward_sow_irr, rabi_disruption_days)');
