@@ -1,0 +1,145 @@
+// ======================================================
+// STATIC LAYERS FOR CROP ROTATION GDD — NORTHERN HEMISPHERE (v33-North)
+// • Band names updated exactly as requested
+// • meanMinSoilC, safeBegin (from shiftedBegin), farmerBegin, safeEnd (from meanThermalEndSafe),
+//   autumn_start_doy, autumn_end_doy
+// • Bug fixed: .expression() now uses properly renamed bands + combined image
+//   (this was causing the "Band pattern 'x' did not match any bands" error)
+// ======================================================
+
+var startYear = 1951;
+var endYear = 1980;
+var testMode = false;
+var productionDeg = 0.1;
+var pureClimaticMaskAsset = 'projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg';
+var exportScale = testMode ? 55632 : Math.round(productionDeg * 111320);
+
+// === GEOMETRY ===
+var seAsiaTest = ee.Geometry.Rectangle([105.0, 16.0, 113.5, 23.5]);
+var safeClip = ee.Geometry.Polygon([[[-179, -89], [179, -89], [179, 89], [-179, 89], [-179, -89]]], null, false);
+var region = testMode ? seAsiaTest : safeClip;
+
+// === MASKS ===
+var pureClimaticMask = ee.Image(pureClimaticMaskAsset).select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .first().select('soil_temperature_level_1').mask().not();
+var computeMask = pureClimaticMask.and(oceanMask.not());
+
+// === 1. MEAN MIN SOIL TEMP ===
+var meanMinSoilC = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(y) {
+    return ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .select('soil_temperature_level_1')
+      .min().subtract(273.15)
+      .updateMask(computeMask);
+  })
+).mean().rename('mean_min_soil_c');
+
+// === 2. JULY-1 PIVOT THERMAL BEGIN + END ===
+var thermalLayers = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(y) {
+    var col = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .select(['soil_temperature_level_1', 'temperature_2m_min', 'snow_cover']);
+  
+    var daily = col.map(function(img) {
+      var soilC = img.select('soil_temperature_level_1').subtract(273.15);
+      var tminC = img.select('temperature_2m_min').subtract(273.15);
+      var snow = img.select('snow_cover');
+      var doy = ee.Image.constant(ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)).toInt32().rename('doy');
+      var limiting = snow.gt(0.05).or(soilC.lt(5)).or(tminC.lt(0)).rename('limiting');
+      return img.addBands([doy, limiting]);
+    });
+    var pivotDOY = 182;
+    var prePivot = daily.filter(ee.Filter.calendarRange(1, pivotDOY - 1, 'day_of_year'));
+    var limDOY_spring = prePivot.map(function(img) {
+      return img.select('doy').updateMask(img.select('limiting')).rename('lim_doy');
+    });
+    var lastLimiting = limDOY_spring.reduce(ee.Reducer.max()).unmask(0);
+    var thermalBeginSafe = lastLimiting.add(7).max(1).rename('thermal_begin_safe_doy');
+    var postPivot = daily.filter(ee.Filter.calendarRange(pivotDOY + 1, 366, 'day_of_year'));
+    var limDOY_fall = postPivot.map(function(img) {
+      return img.select('doy').updateMask(img.select('limiting')).rename('lim_doy');
+    });
+    var firstLimiting = limDOY_fall.reduce(ee.Reducer.min()).unmask(365);
+    var thermalEndSafe = firstLimiting.subtract(1).max(pivotDOY).rename('thermal_end_safe_doy');
+    return thermalBeginSafe.addBands(thermalEndSafe).updateMask(computeMask);
+  })
+);
+
+var meanThermalEndSafe = thermalLayers.select('thermal_end_safe_doy').mean().round();
+var shiftedBegin = thermalLayers.select('thermal_begin_safe_doy').mean().round();
+var gsl = meanThermalEndSafe.subtract(shiftedBegin);
+
+// === 3. SPRING AGGRESSIVENESS (fixed .expression()) ===
+var safeBegin = shiftedBegin.rename('safeBegin');
+
+// Combine with renamed bands so b("x") and b("gsl") work correctly
+var springInputs = shiftedBegin.rename('x')
+  .addBands(gsl.rename('gsl'));
+
+var aggressiveness = springInputs.expression(
+  'min(max(b("x") - 96, 0) * (50 / 34), 50) ' +
+  '* max(0, min(1, 1 - (b("gsl") - 175) / 50))'
+);
+
+var farmerBegin = shiftedBegin.subtract(aggressiveness)
+  .max(1)
+  .round()
+  .rename('farmerBegin');
+
+var safeEnd = meanThermalEndSafe.rename('safeEnd');
+
+// === 4. AUTUMN LOGIC (fixed .expression()) ===
+var autumnStartDOY = meanThermalEndSafe
+  .subtract(70)
+  .max(1)
+  .round()
+  .rename('autumn_start_doy');
+
+// endWindow (single-band, so rename before expression)
+var endWindow = gsl.rename('gsl').expression(
+  '15 - 30 * min(max(b("gsl") - 130, 0) / 50, 1)'
+).rename('end_window_days');
+
+var autumnEndDOY = meanThermalEndSafe
+  .subtract(endWindow)
+  .round()
+  .rename('autumn_end_doy');
+
+// === COMBINE — ONLY THE EXACT BANDS YOU ASKED FOR ===
+var staticLayers = meanMinSoilC
+  .addBands(safeBegin)
+  .addBands(farmerBegin)
+  .addBands(safeEnd)
+  .addBands(autumnStartDOY)
+  .addBands(autumnEndDOY)
+  .unmask(0);
+
+// === EXPORTS ===
+var exportName = testMode ? 'StaticCropRotationLayers_Test_v33-North' : 'StaticCropRotationLayers_1951_1980_03deg_v33-North';
+var timestamp = new Date().toISOString().slice(0,19).replace(/[:.]/g, '-');
+
+Export.image.toAsset({
+  image: staticLayers, 
+  description: exportName, 
+  assetId: 'users/joesco726/' + exportName, 
+  scale: exportScale, 
+  region: region, 
+  crs: 'EPSG:4326', 
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: staticLayers.toFloat(),
+  description: exportName + '_drive_' + timestamp,
+  folder: 'GSL_Exports_North',
+  fileNamePrefix: exportName + '_' + timestamp,
+  scale: exportScale,
+  region: region,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+print('v33-North ready — Bands: mean_min_soil_c, safeBegin, farmerBegin, safeEnd, autumn_start_doy, autumn_end_doy');
