@@ -253,26 +253,36 @@ var computeYearBoundaries = function(y) {
   // Fallback: always-cool pixel → heat_open = start of window (no heat was
   // ever a barrier). No-moisture pixel → moisture_open = end of window
   // (rainfed sowing never possible during this window).
-  var heatOpenDOY = firstSustainedDOY(autumnFlagged, 'cool_flag', nAutumn)
-    .unmask(P.AUTUMN_MIN_DOY);
-  var moistureOpenDOY = firstSustainedDOY(autumnFlagged, 'moist_flag', nAutumn)
-    .unmask(P.AUTUMN_MAX_DOY);
+  var heatOpenRaw     = firstSustainedDOY(autumnFlagged, 'cool_flag',  nAutumn);
+  var moistureOpenRaw = firstSustainedDOY(autumnFlagged, 'moist_flag', nAutumn);
+  var heatOpenFB      = heatOpenRaw.mask().not().rename('heat_open_fallback');
+  var moistureOpenFB  = moistureOpenRaw.mask().not().rename('moisture_open_fallback');
+  var heatOpenDOY     = heatOpenRaw.unmask(P.AUTUMN_MIN_DOY);
+  var moistureOpenDOY = moistureOpenRaw.unmask(P.AUTUMN_MAX_DOY);
 
   // ── Season closing (spring): first SUSTAINED warm / dry; single hard heat ──
   // Fallback = SPRING_MAX_DOY (season never heat-closed / drought-closed in
   // spring → allow full spring window; conservative for backward scheduling).
-  var heatCloseDOY = firstSustainedDOY(springFlagged, 'warm_flag', nSpring)
-    .unmask(P.SPRING_MAX_DOY);
-  var hardHeatCloseDOY = firstSingleDOY(springFlagged, 'hard_flag', nSpring)
-    .unmask(P.SPRING_MAX_DOY);
-  var moistureCloseDOY = firstSustainedDOY(springFlagged, 'dry_flag', nSpring)
-    .unmask(P.SPRING_MAX_DOY);
+  var heatCloseRaw     = firstSustainedDOY(springFlagged, 'warm_flag', nSpring);
+  var hardHeatCloseRaw = firstSingleDOY(springFlagged,    'hard_flag', nSpring);
+  var moistureCloseRaw = firstSustainedDOY(springFlagged, 'dry_flag',  nSpring);
+  var heatCloseFB      = heatCloseRaw.mask().not().rename('heat_close_fallback');
+  var hardHeatCloseFB  = hardHeatCloseRaw.mask().not().rename('hard_heat_close_fallback');
+  var moistureCloseFB  = moistureCloseRaw.mask().not().rename('moisture_close_fallback');
+  var heatCloseDOY     = heatCloseRaw.unmask(P.SPRING_MAX_DOY);
+  var hardHeatCloseDOY = hardHeatCloseRaw.unmask(P.SPRING_MAX_DOY);
+  var moistureCloseDOY = moistureCloseRaw.unmask(P.SPRING_MAX_DOY);
 
   return heatOpenDOY.rename('heat_open_doy')
     .addBands(moistureOpenDOY.rename('moisture_open_doy'))
     .addBands(heatCloseDOY.rename('heat_close_doy'))
     .addBands(hardHeatCloseDOY.rename('hard_heat_close_doy'))
     .addBands(moistureCloseDOY.rename('moisture_close_doy'))
+    .addBands(heatOpenFB)
+    .addBands(moistureOpenFB)
+    .addBands(heatCloseFB)
+    .addBands(hardHeatCloseFB)
+    .addBands(moistureCloseFB)
     .updateMask(computeMask);
 };
 
@@ -308,6 +318,18 @@ var moistureCloseMean = yearlyStack.select('moisture_close_doy')
   .reduce(ee.Reducer.mean()).round()
   .rename('moisture_close_doy');
 
+// ── Fallback year counts ─────────────────────────────────────────────────────
+// Per-pixel count of years where each band used the fallback value rather than
+// a genuine detection. 0 = always detected; N = fallback in every year.
+var fallbackCounts = yearlyStack.select(['.*_fallback']).sum()
+  .rename([
+    'heat_open_fallback_yrs',
+    'moisture_open_fallback_yrs',
+    'heat_close_fallback_yrs',
+    'hard_heat_close_fallback_yrs',
+    'moisture_close_fallback_yrs'
+  ]);
+
 // ── backward_sow_irr ─────────────────────────────────────────────────────────
 // Ideal irrigated backward-sow target based on heat close.
 // NH: heat_close_doy is raw spring DOY (1-182). Adding 365 converts to rabi-
@@ -328,13 +350,14 @@ var staticLayers = heatOpenP20
   .addBands(hardHeatCloseMean)
   .addBands(moistureCloseMean)
   .addBands(backwardSowIrr)
+  .addBands(fallbackCounts)
   .unmask(0);
 
 // ── Diagnostic print ─────────────────────────────────────────────────────────
 print(HEMISPHERE + ' composite window sizes:', nAutumn, 'autumn composites,', nSpring, 'spring composites');
 print(HEMISPHERE + ' autumn starts (first/last):', autumnStarts[0], autumnStarts[nAutumn - 1]);
 print(HEMISPHERE + ' spring starts (first/last):', springStarts[0], springStarts[nSpring - 1]);
-print('Band order: heat_open_doy | moisture_open_doy | heat_close_doy | hard_heat_close_doy | moisture_close_doy | backward_sow_irr');
+print('Band order: heat_open_doy | moisture_open_doy | heat_close_doy | hard_heat_close_doy | moisture_close_doy | backward_sow_irr | heat_open_fallback_yrs | moisture_open_fallback_yrs | heat_close_fallback_yrs | hard_heat_close_fallback_yrs | moisture_close_fallback_yrs');
 
 // ── Export ───────────────────────────────────────────────────────────────────
 var exportName = testMode
