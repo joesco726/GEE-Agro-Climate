@@ -352,7 +352,8 @@ Export.image.toAsset({
   scale: exportScale,
   region: P.GEOMETRY,
   crs: 'EPSG:4326',
-  maxPixels: 1e13
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'sample'}
 });
 
 Export.image.toDrive({
@@ -363,5 +364,6 @@ Export.image.toDrive({
   scale: exportScale,
   region: P.GEOMETRY,
   crs: 'EPSG:4326',
-  maxPixels: 1e13
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'sample'}
 });
