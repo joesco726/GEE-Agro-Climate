@@ -126,13 +126,11 @@ var statics = ee.Image(P.CROP_STATIC);
 var meanMinSoilC = statics.select('b1').rename('mean_min_soil_c');
 var vernStatic = ee.Image('projects/northern-growing-seasons-v1/assets/vernalization_static_v3_PL');
 var meanVernProgress = vernStatic.select('b3').rename('mean_vernal_progress');
-// Vernalization zone from the existing static (zones 1–4, correct classification).
+// Vernalization zone from the dedicated zones asset (1–4 integer classification).
 // Zone 1 = cold-continental (strong vernalization demand) → winter-spring script scope.
-// Zones 2–4 = this script's domain. Do NOT recompute inline from crop-static b1 —
-// that approach conflated very-cold pixels (soil ≤ 0°C) with tropical zone 4,
-// causing cold-continental pixels to pass the rabi mask incorrectly.
-// ← Confirm band name in vernalization_static_v3_PL (b1 or dedicated zone band).
-var vernZone = vernStatic.select('b1').toByte().rename('vern_zone');
+// Zones 2–4 = this script's domain.
+var vernZone = ee.Image('projects/northern-growing-seasons-v1/assets/vernalization_zones')
+  .toByte().rename('vern_zone');
 var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg')
   .select(0).unmask(0);
 var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR').first()
