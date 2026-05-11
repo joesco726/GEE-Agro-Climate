@@ -156,8 +156,8 @@ var meanMinSoilC  = statics.select('b1').rename('mean_min_soil_c');
 //   SH: raw DOY 189–280 (Jul–Oct). No offset needed.
 // safeEnd: first frost/cold-soil limiting day of autumn − 1d (30-yr mean).
 //   Sentinel safeEnd == SAFE_END_FALLBACK → frost-free pixel; frost constraint non-binding.
-var safeBeginRaw = statics.select('safeBegin');
-var safeEndStatic = statics.select('safeEnd');
+var safeBeginRaw = statics.select('b2');   // safeBegin: last spring limiting DOY + 7d
+var safeEndStatic = statics.select('b4');  // safeEnd: first autumn limiting DOY − 1d
 var vernStatic = ee.Image('projects/northern-growing-seasons-v1/assets/vernalization_static_v3_PL');
 var meanVernProgress = vernStatic.select('b3').rename('mean_vernal_progress');
 // Vernalization zone from the dedicated zones asset (1–4 integer classification).
