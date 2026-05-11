@@ -678,39 +678,51 @@ var collectionAssetId =
   P.ASSET_SUFFIX + '_v14';
 var driveFolder = 'RabiMetrics_v14_' + P.ASSET_SUFFIX;
 var descPrefix  = 'RabiMetrics_v14_' + P.ASSET_SUFFIX + '_';
-var yearsList   = ee.List.sequence(startYear, endYear);
+// Build the year list client-side — no server round-trip needed for a simple sequence.
+// Submit one year at a time via setTimeout so the browser stays responsive between
+// computation-graph builds (each computeYearMetrics call is ~100-300ms of JS work).
+var exportYears = [];
+for (var _y = startYear; _y <= endYear; _y++) exportYears.push(_y);
+var _taskIdx = 0;
 
-yearsList.evaluate(function(years) {
-  years.forEach(function(y) {
-    var yearStr = ('0000' + y).slice(-4);
-    var img = computeYearMetrics(ee.Number(y));
-    if (EXPORT_TO_ASSET) {
-      Export.image.toAsset({
-        image: img,
-        description: descPrefix + yearStr,
-        assetId: collectionAssetId + '/' + yearStr,
-        scale: 11132,
-        region: fullGeometry,
-        crs: 'EPSG:4326',
-        maxPixels: 1e13,
-        pyramidingPolicy: {'.default': 'sample'}
-      });
-    }
-    if (EXPORT_TO_DRIVE) {
-      Export.image.toDrive({
-        image: img,
-        description: 'RabiDrive_v14_' + P.ASSET_SUFFIX + '_' + yearStr,
-        folder: driveFolder,
-        fileNamePrefix: descPrefix + yearStr,
-        scale: 11132,
-        region: fullGeometry,
-        crs: 'EPSG:4326',
-        maxPixels: 1e13,
-        fileFormat: 'GeoTIFF'
-      });
-    }
-  });
-});
+function submitNextYear() {
+  if (_taskIdx >= exportYears.length) {
+    print('✅ All ' + exportYears.length + ' exports submitted.');
+    return;
+  }
+  var y = exportYears[_taskIdx++];
+  var yearStr = ('0000' + y).slice(-4);
+  var img = computeYearMetrics(ee.Number(y));
+  if (EXPORT_TO_ASSET) {
+    Export.image.toAsset({
+      image: img,
+      description: descPrefix + yearStr,
+      assetId: collectionAssetId + '/' + yearStr,
+      scale: 11132,
+      region: fullGeometry,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13,
+      pyramidingPolicy: {'.default': 'sample'}
+    });
+  }
+  if (EXPORT_TO_DRIVE) {
+    Export.image.toDrive({
+      image: img,
+      description: 'RabiDrive_v14_' + P.ASSET_SUFFIX + '_' + yearStr,
+      folder: driveFolder,
+      fileNamePrefix: descPrefix + yearStr,
+      scale: 11132,
+      region: fullGeometry,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13,
+      fileFormat: 'GeoTIFF'
+    });
+  }
+  setTimeout(submitNextYear, 50);
+}
+
+print('Submitting ' + exportYears.length + ' years — tasks will appear incrementally...');
+submitNextYear();
 
 // ======================================================
 // PART 2 — 30-YEAR SUMMARY STATIC (run after Part 1)
