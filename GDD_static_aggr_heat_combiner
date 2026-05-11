@@ -1,0 +1,98 @@
+// ======================================================
+// HEAT / DROUGHT STATIC LAYERS v1 — COMBINER
+// Combines 3 decadal batch images into final 11-band static.
+// Change HEMISPHERE at the top. Run once per hemisphere.
+// ======================================================
+
+var HEMISPHERE = 'SH';   // ←←← CHANGE TO 'NH' or 'SH'
+
+var HEMI_PARAMS = {
+  NH: {
+    CLOSE_DOY_WRAP_ADD: 365,
+    REGION: ee.Geometry.Polygon([[
+      [-179.99, -10], [179.99, -10], [179.99, 75], [-179.99, 75]
+    ]], null, false)
+  },
+  SH: {
+    CLOSE_DOY_WRAP_ADD: 0,
+    REGION: ee.Geometry.Polygon([[
+      [-179.99, -55], [179.99, -55], [179.99, 0], [-179.99, 0]
+    ]], null, false)
+  }
+};
+var P = HEMI_PARAMS[HEMISPHERE];
+var EXPECTED_SEASON_DAYS = 150;
+
+var batch1951 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1951_1960');
+var batch1961 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1961_1970');
+var batch1971 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1971_1980');
+
+print('Batch 1951-1960 bands:', batch1951.bandNames().length());
+print('Batch 1961-1970 bands:', batch1961.bandNames().length());
+print('Batch 1971-1980 bands:', batch1971.bandNames().length());
+
+var allYearsImage = batch1951.addBands(batch1961).addBands(batch1971);
+
+// ── Aggregations ───────────────────────────────────────────────────────────
+var heatOpenP20 = allYearsImage.select('heat_open_doy_.*')
+  .reduce(ee.Reducer.percentile([20])).round().rename('heat_open_doy');
+
+var moistureOpenP20 = allYearsImage.select('moisture_open_doy_.*')
+  .reduce(ee.Reducer.percentile([20])).round().rename('moisture_open_doy');
+
+var heatCloseMean = allYearsImage.select('heat_close_doy_.*')
+  .reduce(ee.Reducer.mean()).round().rename('heat_close_doy');
+
+var hardHeatCloseMean = allYearsImage.select('hard_heat_close_doy_.*')
+  .reduce(ee.Reducer.mean()).round().rename('hard_heat_close_doy');
+
+var moistureCloseMean = allYearsImage.select('moisture_close_doy_.*')
+  .reduce(ee.Reducer.mean()).round().rename('moisture_close_doy');
+
+// ── Fallback counts ────────────────────────────────────────────────────────
+var heatOpenFB      = allYearsImage.select('heat_open_fallback_.*').reduce(ee.Reducer.sum()).rename('heat_open_fallback_yrs');
+var moistureOpenFB  = allYearsImage.select('moisture_open_fallback_.*').reduce(ee.Reducer.sum()).rename('moisture_open_fallback_yrs');
+var heatCloseFB     = allYearsImage.select('heat_close_fallback_.*').reduce(ee.Reducer.sum()).rename('heat_close_fallback_yrs');
+var hardHeatCloseFB = allYearsImage.select('hard_heat_close_fallback_.*').reduce(ee.Reducer.sum()).rename('hard_heat_close_fallback_yrs');
+var moistureCloseFB = allYearsImage.select('moisture_close_fallback_.*').reduce(ee.Reducer.sum()).rename('moisture_close_fallback_yrs');
+
+var fallbackCounts = heatOpenFB
+  .addBands(moistureOpenFB)
+  .addBands(heatCloseFB)
+  .addBands(hardHeatCloseFB)
+  .addBands(moistureCloseFB);
+
+// ── backward_sow_irr ───────────────────────────────────────────────────────
+// NH: heat_close is raw spring DOY (1-177); add 365 to wrap, subtract season.
+// SH: heat_close is raw austral-spring DOY (217-361); no wrap offset.
+var backwardSowIrr = heatCloseMean
+  .add(P.CLOSE_DOY_WRAP_ADD)
+  .subtract(EXPECTED_SEASON_DAYS)
+  .round()
+  .rename('backward_sow_irr');
+
+// ── Final image ────────────────────────────────────────────────────────────
+var staticLayers = heatOpenP20
+  .addBands(moistureOpenP20)
+  .addBands(heatCloseMean)
+  .addBands(hardHeatCloseMean)
+  .addBands(moistureCloseMean)
+  .addBands(backwardSowIrr)
+  .addBands(fallbackCounts)
+  .unmask(0)
+  .clip(P.REGION);
+
+// ── Export ─────────────────────────────────────────────────────────────────
+Export.image.toAsset({
+  image: staticLayers,
+  description: 'HeatDroughtStatic_1951_1980_' + HEMISPHERE + '_v1',
+  assetId: 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v1',
+  scale: 11132,
+  region: P.REGION,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'sample'}
+});
+
+print('✅ Combiner started for ' + HEMISPHERE);
+print('Asset: projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v1');

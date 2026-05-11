@@ -1,167 +1,69 @@
 // ======================================================
-// HEAT / DROUGHT STATIC LAYERS v1
-// Hemisphere-switchable via HEMISPHERE variable ('NH' or 'SH').
-//
-// Complements GDD_static_aggr (frost/soil-based season limits) by capturing
-// when summer heat releases in autumn (season opening) and reasserts in spring
-// (season closing), plus root-zone soil moisture signals for rainfed planting.
-//
-// Algorithm:
-//   Per year (1951-1980), find the first SUSTAINED threshold crossing using
-//   2 consecutive 8-day mean composites for each event. Collect 30 annual DOY
-//   images into a stack, then:
-//     • Season-opening bands → P20 (20th percentile of DOY, i.e., the date by
-//       which only 20 % of years had already met the criterion — early-biased
-//       search start, analogous to farmerBegin vs safeBegin in GDD_static_aggr).
-//     • Season-closing bands → 30-year mean (typical anchor for backward scheduling).
-//
-// Output bands (raw calendar DOY, 1-365, unless noted):
-//
-//   heat_open_doy        P20 autumn DOY: 8-day mean Tmax first drops ≤ 28 °C
-//                        for 2+ consecutive composites.
-//                        Fallback = AUTUMN_MIN_DOY (always-cool pixel → open from day 1).
-//                        NH: ~DOY 220-320. SH: ~DOY 90-180.
-//
-//   moisture_open_doy    P20 autumn DOY: 8-day mean root-zone VSW (0-28 cm weighted)
-//                        first rises ≥ 0.22 for 2+ consecutive composites.
-//                        Fallback = AUTUMN_MAX_DOY (no autumn moisture → end of window).
-//                        NH: ~DOY 240-340. SH: ~DOY 100-200.
-//
-//   heat_close_doy       MEAN spring DOY: 8-day mean Tmax first rises ≥ 28 °C
-//                        for 2+ consecutive composites. Backward-scheduling anchor W.
-//                        Fallback = SPRING_MAX_DOY (no spring warming → late spring window).
-//                        NH stored as RAW spring DOY (1-182); consumer adds 365.
-//                        NH: ~DOY 90-160. SH: ~DOY 260-330.
-//
-//   hard_heat_close_doy  MEAN spring DOY: 8-day mean Tmax first exceeds 35 °C
-//                        (single composite; hard crop-kill threshold).
-//                        Fallback = SPRING_MAX_DOY. NH: ~DOY 80-140. SH: ~DOY 250-310.
-//
-//   moisture_close_doy   MEAN spring DOY: 8-day mean root-zone VSW first drops
-//                        ≤ 0.12 for 2+ consecutive composites. Terminal drought.
-//                        Fallback = SPRING_MAX_DOY. NH: ~DOY 80-160. SH: ~DOY 250-340.
-//
-//   backward_sow_irr     DERIVED: ideal irrigated sow DOY (season-native wrapped).
-//                        = heat_close_doy(wrapped) − EXPECTED_SEASON_DAYS.
-//                        NH: add 365 to raw spring heat_close_doy first (~DOY 305-395).
-//                        SH: no wrap offset needed (~DOY 110-180).
-//
-// Consumer notes for GDD_bigStatic_rabi:
-//   NH: heat_close_doy / hard_heat_close_doy / moisture_close_doy are stored as
-//       raw spring DOY (1-182). To use in rabi-wrapped DOY system, add 365.
-//   SH: all bands in raw calendar DOY (autumn DOY 33-209, spring DOY 217-365).
-//   Both hemispheres: heat_open_doy and moisture_open_doy are raw autumn DOY;
-//       no offset needed. backward_sow_irr is pre-computed in wrapped DOY.
+// HEAT / DROUGHT STATIC LAYERS v1 — BATCH RUNNER (FINAL RELIABLE VERSION)
+// Paste the ENTIRE script. Change ONLY the two top lines. Run 3× per hemisphere.
 // ======================================================
 
-var START_YEAR  = 1951;
-var END_YEAR    = 1980;
-var HEMISPHERE  = 'NH';   // 'NH' or 'SH'
+var HEMISPHERE = 'NH';   // ←←← CHANGE TO 'NH' or 'SH'
+var BATCH      = 1;      // ←←← CHANGE TO 1, 2, or 3
+
+var START_YEAR = (BATCH === 1) ? 1951 : (BATCH === 2) ? 1961 : 1971;
+var END_YEAR   = (BATCH === 1) ? 1960 : (BATCH === 2) ? 1970 : 1980;
+
 var testMode    = false;
 var productionDeg = 0.1;
 
-// ── Thresholds ──────────────────────────────────────────────────────────────
-var TMAX_HEAT_OPEN   = 28.0;  // °C  — autumn cooling into cool-season planting window
-var TMAX_HEAT_CLOSE  = 28.0;  // °C  — spring re-warming out of planting window
-var TMAX_HARD_HEAT   = 35.0;  // °C  — hard crop-kill / grain-filling heat threshold
-var VSW_MOIST_OPEN   = 0.22;  // m³/m³ — autumn soil wetting (sowing-adequate moisture)
-var VSW_MOIST_CLOSE  = 0.12;  // m³/m³ — spring drying (terminal rainfed drought)
-// Root-zone VSW weights (layers 1: 0-7 cm, 2: 7-28 cm) — matches GDD_bigStatic_rabi
+// ── Original parameters (unchanged) ────────────────────────────────────────
+var TMAX_HEAT_OPEN   = 28.0;
+var TMAX_HEAT_CLOSE  = 28.0;
+var TMAX_HARD_HEAT   = 35.0;
+var VSW_MOIST_OPEN   = 0.22;
+var VSW_MOIST_CLOSE  = 0.12;
 var VSW_W1 = 0.30;
 var VSW_W2 = 0.70;
-// Season length used to back-compute irrigated sow target from heat close
 var EXPECTED_SEASON_DAYS = 150;
 
-// ── Hemisphere parameters ────────────────────────────────────────────────────
-// Autumn window (season opening): where we search for the first cool/moist signal.
-// Spring window (season closing): where we search for heat/drought re-assertion.
-//
-// Standard GEE 8-day period starts: 1, 9, 17, …, 361. We restrict to starts
-// within [MIN_DOY, MAX_DOY] (both inclusive). This avoids partial composites
-// that would contaminate the boundary.
-//
-// NH: autumn cooling (Jul-Dec of year Y) → season opens post-summer.
-//     spring warming (Jan-Jun of year Y+1) → season ends pre-monsoon.
-// SH: autumn cooling (Feb-Jul of year Y) → austral autumn into winter.
-//     spring warming (Aug-Dec of same year Y) → austral spring/spring.
 var HEMI_PARAMS = {
   NH: {
-    // Autumn window: DOY 185-361 (Jul 4 → Dec 27, first full period after Jul 1)
-    AUTUMN_MIN_DOY: 185,
-    AUTUMN_MAX_DOY: 361,
-    AUTUMN_YEAR_OFFSET: 0,    // autumn data from same year Y
-    // Spring window: DOY 1-177 (Jan 1 → Jun 26, last full period before Jul 1)
-    SPRING_MIN_DOY: 1,
-    SPRING_MAX_DOY: 177,
-    SPRING_YEAR_OFFSET: 1,    // spring data from year Y+1
-    // backward_sow_irr = heat_close_doy + 365 − EXPECTED_SEASON_DAYS
-    // (converts raw spring DOY to rabi-wrapped DOY, then subtracts season length)
+    AUTUMN_MIN_DOY: 185, AUTUMN_MAX_DOY: 361, AUTUMN_YEAR_OFFSET: 0,
+    SPRING_MIN_DOY: 1,   SPRING_MAX_DOY: 177, SPRING_YEAR_OFFSET: 1,
     CLOSE_DOY_WRAP_ADD: 365,
-    GEOMETRY: ee.Geometry.Polygon(
-      [[[-180, -10], [180, -10], [180, 75], [-180, 75]]], null, false),
-    ASSET_SUFFIX: 'NH_v1'
+    GEOMETRY: ee.Geometry.Polygon([[[-180, -10], [180, -10], [180, 75], [-180, 75]]], null, false)
   },
   SH: {
-    // Autumn window: DOY 33-209 (Feb 2 → Jul 28, austral autumn/early winter)
-    AUTUMN_MIN_DOY: 33,
-    AUTUMN_MAX_DOY: 209,
-    AUTUMN_YEAR_OFFSET: 0,
-    // Spring window: DOY 217-361 (Aug 5 → Dec 27, austral spring)
-    SPRING_MIN_DOY: 217,
-    SPRING_MAX_DOY: 361,
-    SPRING_YEAR_OFFSET: 0,    // spring data from same year Y
-    // backward_sow_irr = heat_close_doy + 0 − EXPECTED_SEASON_DAYS
-    // (raw same-year spring DOY minus season length → raw austral autumn DOY)
+    AUTUMN_MIN_DOY: 33,  AUTUMN_MAX_DOY: 209, AUTUMN_YEAR_OFFSET: 0,
+    SPRING_MIN_DOY: 217, SPRING_MAX_DOY: 361, SPRING_YEAR_OFFSET: 0,
     CLOSE_DOY_WRAP_ADD: 0,
-    GEOMETRY: ee.Geometry.Polygon(
-      [[[-180, -55], [180, -55], [180, 0], [-180, 0]]], null, false),
-    ASSET_SUFFIX: 'SH_v1'
+    GEOMETRY: ee.Geometry.Polygon([[[-180, -55], [180, -55], [180, 0], [-180, 0]]], null, false)
   }
 };
 var P = HEMI_PARAMS[HEMISPHERE];
 
-// ── Global masks (identical to GDD_static_aggr) ──────────────────────────────
-var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg')
-  .select(0).unmask(0);
-var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
-  .first().select('soil_temperature_level_1').mask().not();
+var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg').select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR').first().select('soil_temperature_level_1').mask().not();
 var computeMask = pureClimaticMask.and(oceanMask.not());
 
-// ── Export scale ─────────────────────────────────────────────────────────────
 var exportScale = testMode ? 55632 : Math.round(productionDeg * 111320);
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-// Build sorted list of standard 8-day start DOYs (1,9,17,…,361) within [minDoy,maxDoy]
+// ── All original helper functions (exact copy) ─────────────────────────────
 var get8DayStarts = function(minDoy, maxDoy) {
   var starts = [];
   for (var sd = 1; sd <= 361; sd += 8) {
-    if (sd >= minDoy && sd <= maxDoy) {
-      starts.push(sd);
-    }
+    if (sd >= minDoy && sd <= maxDoy) starts.push(sd);
   }
   return starts;
 };
 
-// Build 8-day mean composites from a daily IC.
-// startDoys: client-side JS array of standard 8-day start DOYs.
-// Each output image has 'start_doy' set as both a property and a constant band.
 var makeComposites = function(daily, startDoys) {
   var composites = [];
   for (var j = 0; j < startDoys.length; j++) {
     var sd = startDoys[j];
     var window = daily.filter(ee.Filter.calendarRange(sd, sd + 7, 'day_of_year'));
-    var comp = window.mean()
-      .set('start_doy', sd);
+    var comp = window.mean().set('start_doy', sd);
     composites.push(comp);
   }
   return ee.ImageCollection(composites);
 };
 
-// Return the DOY of the first pair of consecutive composites both meeting criterion.
-// composites: IC with 'start_doy' property and a binary 'flagBand' (0/1).
-// count: client-side JS integer (= startDoys.length) to avoid server-side size eval.
-// Returns single-band image 'first_doy'; masked where criterion never sustained.
 var firstSustainedDOY = function(composites, flagBand, count) {
   var compList = composites.toList(count);
   var sustainedList = ee.List.sequence(0, count - 2).map(function(i) {
@@ -172,13 +74,9 @@ var firstSustainedDOY = function(composites, flagBand, count) {
     var doy = ee.Image.constant(ee.Number(curr.get('start_doy'))).toFloat();
     return doy.updateMask(sustained);
   });
-  return ee.ImageCollection(sustainedList)
-    .reduce(ee.Reducer.min())
-    .rename('first_doy');
+  return ee.ImageCollection.fromImages(sustainedList).reduce(ee.Reducer.min()).rename('first_doy');
 };
 
-// Return the DOY of the first single composite meeting criterion.
-// Used for hard_heat_close_doy (a single composite suffices for a kill event).
 var firstSingleDOY = function(composites, flagBand, count) {
   var compList = composites.toList(count);
   var singleList = ee.List.sequence(0, count - 1).map(function(i) {
@@ -188,26 +86,16 @@ var firstSingleDOY = function(composites, flagBand, count) {
     var doy = ee.Image.constant(ee.Number(img.get('start_doy'))).toFloat();
     return doy.updateMask(flag);
   });
-  return ee.ImageCollection(singleList)
-    .reduce(ee.Reducer.min())
-    .rename('first_doy');
+  return ee.ImageCollection.fromImages(singleList).reduce(ee.Reducer.min()).rename('first_doy');
 };
 
-// ── Pre-compute composite DOY index arrays (client-side) ─────────────────────
 var autumnStarts = get8DayStarts(P.AUTUMN_MIN_DOY, P.AUTUMN_MAX_DOY);
 var springStarts = get8DayStarts(P.SPRING_MIN_DOY, P.SPRING_MAX_DOY);
 var nAutumn = autumnStarts.length;
 var nSpring = springStarts.length;
 
-// ERA5-Land bands needed (Tmax + two VSW layers)
-var ERA5_BANDS = [
-  'temperature_2m_max',
-  'volumetric_soil_water_layer_1',
-  'volumetric_soil_water_layer_2'
-];
+var ERA5_BANDS = ['temperature_2m_max', 'volumetric_soil_water_layer_1', 'volumetric_soil_water_layer_2'];
 
-// Derive tmax_c and weighted vsw from raw ERA5-Land image.
-// Preserves system:time_start for calendarRange filtering in makeComposites.
 var deriveDaily = function(img) {
   var tmaxC = img.select('temperature_2m_max').subtract(273.15);
   var vsw   = img.select('volumetric_soil_water_layer_1').multiply(VSW_W1)
@@ -217,7 +105,6 @@ var deriveDaily = function(img) {
     .set('system:time_start', img.get('system:time_start'));
 };
 
-// ── Per-year boundary computation ────────────────────────────────────────────
 var computeYearBoundaries = function(y) {
   y = ee.Number(y);
   var springY = y.add(P.SPRING_YEAR_OFFSET);
@@ -232,11 +119,9 @@ var computeYearBoundaries = function(y) {
     .select(ERA5_BANDS)
     .map(deriveDaily);
 
-  // 8-day mean composites for each window
   var autumnComp = makeComposites(autumnDaily, autumnStarts);
   var springComp = makeComposites(springDaily, springStarts);
 
-  // Add boolean flag bands to each composite
   var autumnFlagged = autumnComp.map(function(img) {
     var cool  = img.select('tmax_c').lte(TMAX_HEAT_OPEN).rename('cool_flag');
     var moist = img.select('vsw').gte(VSW_MOIST_OPEN).rename('moist_flag');
@@ -249,127 +134,53 @@ var computeYearBoundaries = function(y) {
     return img.addBands([warm, hardHeat, dry]);
   });
 
-  // ── Season opening (autumn): first SUSTAINED cool / moist ──────────────────
-  // Fallback: always-cool pixel → heat_open = start of window (no heat was
-  // ever a barrier). No-moisture pixel → moisture_open = end of window
-  // (rainfed sowing never possible during this window).
   var heatOpenRaw     = firstSustainedDOY(autumnFlagged, 'cool_flag',  nAutumn);
   var moistureOpenRaw = firstSustainedDOY(autumnFlagged, 'moist_flag', nAutumn);
-  var heatOpenFB      = heatOpenRaw.mask().not().rename('heat_open_fallback');
-  var moistureOpenFB  = moistureOpenRaw.mask().not().rename('moisture_open_fallback');
-  var heatOpenDOY     = heatOpenRaw.unmask(P.AUTUMN_MIN_DOY);
-  var moistureOpenDOY = moistureOpenRaw.unmask(P.AUTUMN_MAX_DOY);
-
-  // ── Season closing (spring): first SUSTAINED warm / dry; single hard heat ──
-  // Fallback = SPRING_MAX_DOY (season never heat-closed / drought-closed in
-  // spring → allow full spring window; conservative for backward scheduling).
   var heatCloseRaw     = firstSustainedDOY(springFlagged, 'warm_flag', nSpring);
   var hardHeatCloseRaw = firstSingleDOY(springFlagged,    'hard_flag', nSpring);
   var moistureCloseRaw = firstSustainedDOY(springFlagged, 'dry_flag',  nSpring);
-  var heatCloseFB      = heatCloseRaw.mask().not().rename('heat_close_fallback');
-  var hardHeatCloseFB  = hardHeatCloseRaw.mask().not().rename('hard_heat_close_fallback');
-  var moistureCloseFB  = moistureCloseRaw.mask().not().rename('moisture_close_fallback');
-  var heatCloseDOY     = heatCloseRaw.unmask(P.SPRING_MAX_DOY);
-  var hardHeatCloseDOY = hardHeatCloseRaw.unmask(P.SPRING_MAX_DOY);
-  var moistureCloseDOY = moistureCloseRaw.unmask(P.SPRING_MAX_DOY);
 
-  return heatOpenDOY.rename('heat_open_doy')
-    .addBands(moistureOpenDOY.rename('moisture_open_doy'))
-    .addBands(heatCloseDOY.rename('heat_close_doy'))
-    .addBands(hardHeatCloseDOY.rename('hard_heat_close_doy'))
-    .addBands(moistureCloseDOY.rename('moisture_close_doy'))
-    .addBands(heatOpenFB)
-    .addBands(moistureOpenFB)
-    .addBands(heatCloseFB)
-    .addBands(hardHeatCloseFB)
-    .addBands(moistureCloseFB)
+  var img = heatOpenRaw.unmask(P.AUTUMN_MIN_DOY).rename('heat_open_doy')
+    .addBands(moistureOpenRaw.unmask(P.AUTUMN_MAX_DOY).rename('moisture_open_doy'))
+    .addBands(heatCloseRaw.unmask(P.SPRING_MAX_DOY).rename('heat_close_doy'))
+    .addBands(hardHeatCloseRaw.unmask(P.SPRING_MAX_DOY).rename('hard_heat_close_doy'))
+    .addBands(moistureCloseRaw.unmask(P.SPRING_MAX_DOY).rename('moisture_close_doy'))
+    .addBands(heatOpenRaw.mask().not().rename('heat_open_fallback'))
+    .addBands(moistureOpenRaw.mask().not().rename('moisture_open_fallback'))
+    .addBands(heatCloseRaw.mask().not().rename('heat_close_fallback'))
+    .addBands(hardHeatCloseRaw.mask().not().rename('hard_heat_close_fallback'))
+    .addBands(moistureCloseRaw.mask().not().rename('moisture_close_fallback'))
     .updateMask(computeMask);
+
+  // Add year suffix so each year's bands are unique
+  var yearStr = ee.String(ee.Number(y).int());
+  var newBandNames = img.bandNames().map(function(b) {
+    return ee.String(b).cat('_').cat(yearStr);
+  });
+  return img.rename(newBandNames);
 };
 
-// ── Collect 30-year annual stack ─────────────────────────────────────────────
 var yearlyStack = ee.ImageCollection(
   ee.List.sequence(START_YEAR, END_YEAR).map(computeYearBoundaries)
 );
 
-// ── Aggregate across years ───────────────────────────────────────────────────
-// Season-opening bands: P20 (early-biased search start)
-//   P20 of autumn DOY = the date by which only 20 % of years had already seen
-//   the opening signal. Starting the search here means in 80 % of years the
-//   crop precompute begins searching before conditions are actually met and
-//   will wait — analogous to farmerBegin starting earlier than safeBegin.
-var heatOpenP20 = yearlyStack.select('heat_open_doy')
-  .reduce(ee.Reducer.percentile([20])).round()
-  .rename('heat_open_doy');
+// ── Convert to single image + clean band names (this is the key fix) ───────
+var yearlyImage = yearlyStack.toBands();
 
-var moistureOpenP20 = yearlyStack.select('moisture_open_doy')
-  .reduce(ee.Reducer.percentile([20])).round()
-  .rename('moisture_open_doy');
+// Remove the automatic "0_", "1_" prefixes that toBands() adds
+var bandNames = yearlyImage.bandNames();
+var cleanNames = bandNames.map(function(name) {
+  return ee.String(name).replace('^\\d+_', '', 'g');
+});
+var cleanImage = yearlyImage.rename(cleanNames);
 
-// Season-closing bands: 30-year mean (typical close date for backward scheduling)
-var heatCloseMean = yearlyStack.select('heat_close_doy')
-  .reduce(ee.Reducer.mean()).round()
-  .rename('heat_close_doy');
-
-var hardHeatCloseMean = yearlyStack.select('hard_heat_close_doy')
-  .reduce(ee.Reducer.mean()).round()
-  .rename('hard_heat_close_doy');
-
-var moistureCloseMean = yearlyStack.select('moisture_close_doy')
-  .reduce(ee.Reducer.mean()).round()
-  .rename('moisture_close_doy');
-
-// ── Fallback year counts ─────────────────────────────────────────────────────
-// Per-pixel count of years where each band used the fallback value rather than
-// a genuine detection. 0 = always detected; N = fallback in every year.
-var fallbackCounts = yearlyStack.select(['.*_fallback']).sum()
-  .rename([
-    'heat_open_fallback_yrs',
-    'moisture_open_fallback_yrs',
-    'heat_close_fallback_yrs',
-    'hard_heat_close_fallback_yrs',
-    'moisture_close_fallback_yrs'
-  ]);
-
-// ── backward_sow_irr ─────────────────────────────────────────────────────────
-// Ideal irrigated backward-sow target based on heat close.
-// NH: heat_close_doy is raw spring DOY (1-182). Adding 365 converts to rabi-
-//     wrapped DOY (366-547); subtracting season length gives wrapped autumn DOY.
-//     Example: heat_close = DOY 120 (Apr 30) → wrapped = 485 → sow = 335 (Dec 1).
-// SH: heat_close_doy is raw austral-spring DOY (217-361). No wrap offset.
-//     Example: heat_close = DOY 285 (Oct 12) → sow = DOY 135 (May 15).
-var backwardSowIrr = heatCloseMean
-  .add(P.CLOSE_DOY_WRAP_ADD)
-  .subtract(EXPECTED_SEASON_DAYS)
-  .round()
-  .rename('backward_sow_irr');
-
-// ── Assemble output ──────────────────────────────────────────────────────────
-var staticLayers = heatOpenP20
-  .addBands(moistureOpenP20)
-  .addBands(heatCloseMean)
-  .addBands(hardHeatCloseMean)
-  .addBands(moistureCloseMean)
-  .addBands(backwardSowIrr)
-  .addBands(fallbackCounts)
-  .unmask(0);
-
-// ── Diagnostic print ─────────────────────────────────────────────────────────
-print(HEMISPHERE + ' composite window sizes:', nAutumn, 'autumn composites,', nSpring, 'spring composites');
-print(HEMISPHERE + ' autumn starts (first/last):', autumnStarts[0], autumnStarts[nAutumn - 1]);
-print(HEMISPHERE + ' spring starts (first/last):', springStarts[0], springStarts[nSpring - 1]);
-print('Band order: heat_open_doy | moisture_open_doy | heat_close_doy | hard_heat_close_doy | moisture_close_doy | backward_sow_irr | heat_open_fallback_yrs | moisture_open_fallback_yrs | heat_close_fallback_yrs | hard_heat_close_fallback_yrs | moisture_close_fallback_yrs');
-
-// ── Export ───────────────────────────────────────────────────────────────────
-var exportName = testMode
-  ? ('HeatDroughtStatic_Test_' + HEMISPHERE + '_v1')
-  : ('HeatDroughtStatic_1951_1980_' + HEMISPHERE + '_v1');
-
-var assetId = 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v1';
-
-var timestamp = new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-');
+// ── Export using the reliable single-image method ──────────────────────────
+var batchName = (BATCH === 1) ? '1951_1960' : (BATCH === 2) ? '1961_1970' : '1971_1980';
+var exportName = 'HeatDroughtStatic_' + HEMISPHERE + '_yearly_' + batchName;
+var assetId = 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_' + batchName;
 
 Export.image.toAsset({
-  image: staticLayers,
+  image: cleanImage,
   description: exportName,
   assetId: assetId,
   scale: exportScale,
@@ -379,13 +190,5 @@ Export.image.toAsset({
   pyramidingPolicy: {'.default': 'sample'}
 });
 
-Export.image.toDrive({
-  image: staticLayers.toFloat(),
-  description: exportName + '_drive',
-  folder: 'GEE_HeatDrought_Static',
-  fileNamePrefix: exportName + '_' + timestamp,
-  scale: exportScale,
-  region: P.GEOMETRY,
-  crs: 'EPSG:4326',
-  maxPixels: 1e13
-});
+print('✅ Batch ' + BATCH + ' (' + START_YEAR + '-' + END_YEAR + ') for ' + HEMISPHERE + ' started');
+print('Exporting to:', assetId);
