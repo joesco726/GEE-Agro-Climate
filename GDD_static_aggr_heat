@@ -1,0 +1,194 @@
+// ======================================================
+// HEAT / DROUGHT STATIC LAYERS v1 — BATCH RUNNER (FINAL RELIABLE VERSION)
+// Paste the ENTIRE script. Change ONLY the two top lines. Run 3× per hemisphere.
+// ======================================================
+
+var HEMISPHERE = 'NH';   // ←←← CHANGE TO 'NH' or 'SH'
+var BATCH      = 1;      // ←←← CHANGE TO 1, 2, or 3
+
+var START_YEAR = (BATCH === 1) ? 1951 : (BATCH === 2) ? 1961 : 1971;
+var END_YEAR   = (BATCH === 1) ? 1960 : (BATCH === 2) ? 1970 : 1980;
+
+var testMode    = false;
+var productionDeg = 0.1;
+
+// ── Original parameters (unchanged) ────────────────────────────────────────
+var TMAX_HEAT_OPEN   = 28.0;
+var TMAX_HEAT_CLOSE  = 28.0;
+var TMAX_HARD_HEAT   = 35.0;
+var VSW_MOIST_OPEN   = 0.22;
+var VSW_MOIST_CLOSE  = 0.12;
+var VSW_W1 = 0.30;
+var VSW_W2 = 0.70;
+var EXPECTED_SEASON_DAYS = 150;
+
+var HEMI_PARAMS = {
+  NH: {
+    AUTUMN_MIN_DOY: 185, AUTUMN_MAX_DOY: 361, AUTUMN_YEAR_OFFSET: 0,
+    SPRING_MIN_DOY: 1,   SPRING_MAX_DOY: 177, SPRING_YEAR_OFFSET: 1,
+    CLOSE_DOY_WRAP_ADD: 365,
+    GEOMETRY: ee.Geometry.Polygon([[[-180, -10], [180, -10], [180, 75], [-180, 75]]], null, false)
+  },
+  SH: {
+    AUTUMN_MIN_DOY: 33,  AUTUMN_MAX_DOY: 209, AUTUMN_YEAR_OFFSET: 0,
+    SPRING_MIN_DOY: 217, SPRING_MAX_DOY: 361, SPRING_YEAR_OFFSET: 0,
+    CLOSE_DOY_WRAP_ADD: 0,
+    GEOMETRY: ee.Geometry.Polygon([[[-180, -55], [180, -55], [180, 0], [-180, 0]]], null, false)
+  }
+};
+var P = HEMI_PARAMS[HEMISPHERE];
+
+var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg').select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR').first().select('soil_temperature_level_1').mask().not();
+var computeMask = pureClimaticMask.and(oceanMask.not());
+
+var exportScale = testMode ? 55632 : Math.round(productionDeg * 111320);
+
+// ── All original helper functions (exact copy) ─────────────────────────────
+var get8DayStarts = function(minDoy, maxDoy) {
+  var starts = [];
+  for (var sd = 1; sd <= 361; sd += 8) {
+    if (sd >= minDoy && sd <= maxDoy) starts.push(sd);
+  }
+  return starts;
+};
+
+var makeComposites = function(daily, startDoys) {
+  var composites = [];
+  for (var j = 0; j < startDoys.length; j++) {
+    var sd = startDoys[j];
+    var window = daily.filter(ee.Filter.calendarRange(sd, sd + 7, 'day_of_year'));
+    var comp = window.mean().set('start_doy', sd);
+    composites.push(comp);
+  }
+  return ee.ImageCollection(composites);
+};
+
+var firstSustainedDOY = function(composites, flagBand, count) {
+  var compList = composites.toList(count);
+  var sustainedList = ee.List.sequence(0, count - 2).map(function(i) {
+    i = ee.Number(i);
+    var curr = ee.Image(compList.get(i));
+    var next = ee.Image(compList.get(i.add(1)));
+    var sustained = curr.select(flagBand).and(next.select(flagBand));
+    var doy = ee.Image.constant(ee.Number(curr.get('start_doy'))).toFloat();
+    return doy.updateMask(sustained);
+  });
+  return ee.ImageCollection.fromImages(sustainedList).reduce(ee.Reducer.min()).rename('first_doy');
+};
+
+var firstSingleDOY = function(composites, flagBand, count) {
+  var compList = composites.toList(count);
+  var singleList = ee.List.sequence(0, count - 1).map(function(i) {
+    i = ee.Number(i);
+    var img = ee.Image(compList.get(i));
+    var flag = img.select(flagBand);
+    var doy = ee.Image.constant(ee.Number(img.get('start_doy'))).toFloat();
+    return doy.updateMask(flag);
+  });
+  return ee.ImageCollection.fromImages(singleList).reduce(ee.Reducer.min()).rename('first_doy');
+};
+
+var autumnStarts = get8DayStarts(P.AUTUMN_MIN_DOY, P.AUTUMN_MAX_DOY);
+var springStarts = get8DayStarts(P.SPRING_MIN_DOY, P.SPRING_MAX_DOY);
+var nAutumn = autumnStarts.length;
+var nSpring = springStarts.length;
+
+var ERA5_BANDS = ['temperature_2m_max', 'volumetric_soil_water_layer_1', 'volumetric_soil_water_layer_2'];
+
+var deriveDaily = function(img) {
+  var tmaxC = img.select('temperature_2m_max').subtract(273.15);
+  var vsw   = img.select('volumetric_soil_water_layer_1').multiply(VSW_W1)
+    .add(img.select('volumetric_soil_water_layer_2').multiply(VSW_W2));
+  return tmaxC.rename('tmax_c')
+    .addBands(vsw.rename('vsw'))
+    .set('system:time_start', img.get('system:time_start'));
+};
+
+var computeYearBoundaries = function(y) {
+  y = ee.Number(y);
+  var springY = y.add(P.SPRING_YEAR_OFFSET);
+
+  var autumnDaily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+    .filter(ee.Filter.calendarRange(y, y, 'year'))
+    .select(ERA5_BANDS)
+    .map(deriveDaily);
+
+  var springDaily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+    .filter(ee.Filter.calendarRange(springY, springY, 'year'))
+    .select(ERA5_BANDS)
+    .map(deriveDaily);
+
+  var autumnComp = makeComposites(autumnDaily, autumnStarts);
+  var springComp = makeComposites(springDaily, springStarts);
+
+  var autumnFlagged = autumnComp.map(function(img) {
+    var cool  = img.select('tmax_c').lte(TMAX_HEAT_OPEN).rename('cool_flag');
+    var moist = img.select('vsw').gte(VSW_MOIST_OPEN).rename('moist_flag');
+    return img.addBands([cool, moist]);
+  });
+  var springFlagged = springComp.map(function(img) {
+    var warm     = img.select('tmax_c').gte(TMAX_HEAT_CLOSE).rename('warm_flag');
+    var hardHeat = img.select('tmax_c').gte(TMAX_HARD_HEAT).rename('hard_flag');
+    var dry      = img.select('vsw').lte(VSW_MOIST_CLOSE).rename('dry_flag');
+    return img.addBands([warm, hardHeat, dry]);
+  });
+
+  var heatOpenRaw     = firstSustainedDOY(autumnFlagged, 'cool_flag',  nAutumn);
+  var moistureOpenRaw = firstSustainedDOY(autumnFlagged, 'moist_flag', nAutumn);
+  var heatCloseRaw     = firstSustainedDOY(springFlagged, 'warm_flag', nSpring);
+  var hardHeatCloseRaw = firstSingleDOY(springFlagged,    'hard_flag', nSpring);
+  var moistureCloseRaw = firstSustainedDOY(springFlagged, 'dry_flag',  nSpring);
+
+  var img = heatOpenRaw.unmask(P.AUTUMN_MIN_DOY).rename('heat_open_doy')
+    .addBands(moistureOpenRaw.unmask(P.AUTUMN_MAX_DOY).rename('moisture_open_doy'))
+    .addBands(heatCloseRaw.unmask(P.SPRING_MAX_DOY).rename('heat_close_doy'))
+    .addBands(hardHeatCloseRaw.unmask(P.SPRING_MAX_DOY).rename('hard_heat_close_doy'))
+    .addBands(moistureCloseRaw.unmask(P.SPRING_MAX_DOY).rename('moisture_close_doy'))
+    .addBands(heatOpenRaw.mask().not().rename('heat_open_fallback'))
+    .addBands(moistureOpenRaw.mask().not().rename('moisture_open_fallback'))
+    .addBands(heatCloseRaw.mask().not().rename('heat_close_fallback'))
+    .addBands(hardHeatCloseRaw.mask().not().rename('hard_heat_close_fallback'))
+    .addBands(moistureCloseRaw.mask().not().rename('moisture_close_fallback'))
+    .updateMask(computeMask);
+
+  // Add year suffix so each year's bands are unique
+  var yearStr = ee.String(ee.Number(y).int());
+  var newBandNames = img.bandNames().map(function(b) {
+    return ee.String(b).cat('_').cat(yearStr);
+  });
+  return img.rename(newBandNames);
+};
+
+var yearlyStack = ee.ImageCollection(
+  ee.List.sequence(START_YEAR, END_YEAR).map(computeYearBoundaries)
+);
+
+// ── Convert to single image + clean band names (this is the key fix) ───────
+var yearlyImage = yearlyStack.toBands();
+
+// Remove the automatic "0_", "1_" prefixes that toBands() adds
+var bandNames = yearlyImage.bandNames();
+var cleanNames = bandNames.map(function(name) {
+  return ee.String(name).replace('^\\d+_', '', 'g');
+});
+var cleanImage = yearlyImage.rename(cleanNames);
+
+// ── Export using the reliable single-image method ──────────────────────────
+var batchName = (BATCH === 1) ? '1951_1960' : (BATCH === 2) ? '1961_1970' : '1971_1980';
+var exportName = 'HeatDroughtStatic_' + HEMISPHERE + '_yearly_' + batchName;
+var assetId = 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_' + batchName;
+
+Export.image.toAsset({
+  image: cleanImage,
+  description: exportName,
+  assetId: assetId,
+  scale: exportScale,
+  region: P.GEOMETRY,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'sample'}
+});
+
+print('✅ Batch ' + BATCH + ' (' + START_YEAR + '-' + END_YEAR + ') for ' + HEMISPHERE + ' started');
+print('Exporting to:', assetId);
