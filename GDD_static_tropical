@@ -1,0 +1,134 @@
+// ======================================================
+// FINAL PRODUCTION MASK — Hybrid GAEZ + Precip Seasonality
+// Locked at precipSI < 0.55 — 1951–1980 + Drive export
+// ======================================================
+
+var monthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
+  .filterDate('1951-01-01', '1980-12-31')
+  .select(['temperature_2m_max', 'volumetric_soil_water_layer_1', 'volumetric_soil_water_layer_2', 'total_precipitation_sum']);
+
+// Monthly climatologies
+var monthlyClim = ee.ImageCollection.fromImages(
+  ee.List.sequence(1, 12).map(function(m) {
+    m = ee.Number(m);
+    var monthRaw = monthly.filter(ee.Filter.calendarRange(m, m, 'month'));
+    var monthMeanRaw = monthRaw.mean();
+
+    var tmaxC = monthMeanRaw.select('temperature_2m_max').subtract(273.15).rename('tmax_c');
+    var vsw = monthMeanRaw.select('volumetric_soil_water_layer_1').multiply(0.30)
+      .add(monthMeanRaw.select('volumetric_soil_water_layer_2').multiply(0.70))
+      .rename('vsw');
+    var precipMm = monthMeanRaw.select('total_precipitation_sum').multiply(1000).rename('precip_mm');
+
+    return tmaxC.addBands(vsw).addBands(precipMm).set('month', m);
+  })
+);
+
+// Band names
+var bandNames = [];
+for (var i = 1; i <= 12; i++) {
+  bandNames.push('tmax_c_' + i);
+  bandNames.push('vsw_' + i);
+  bandNames.push('precip_mm_' + i);
+}
+var clim = monthlyClim.toBands().rename(bandNames);
+
+// Metrics
+var tmaxBands = [];
+var vswBands = [];
+var precipBands = [];
+for (var i = 1; i <= 12; i++) {
+  tmaxBands.push('tmax_c_' + i);
+  vswBands.push('vsw_' + i);
+  precipBands.push('precip_mm_' + i);
+}
+
+var tmaxRange = clim.select(tmaxBands).reduce(ee.Reducer.max())
+  .subtract(clim.select(tmaxBands).reduce(ee.Reducer.min()))
+  .rename('tmax_annual_range_c');
+
+var minTmax = clim.select(tmaxBands).reduce(ee.Reducer.min())
+  .rename('min_monthly_tmax_c');
+
+var vswRange = clim.select(vswBands).reduce(ee.Reducer.max())
+  .subtract(clim.select(vswBands).reduce(ee.Reducer.min()))
+  .rename('vsw_annual_range');
+
+var maxVSW = clim.select(vswBands).reduce(ee.Reducer.max())
+  .rename('max_monthly_vsw');
+
+// Precip seasonality
+var precipMean = clim.select(precipBands).reduce(ee.Reducer.mean()).rename('precip_mean_mm');
+var precipAbsDev = clim.select(precipBands)
+  .subtract(precipMean)
+  .abs()
+  .reduce(ee.Reducer.sum())
+  .rename('precip_abs_dev');
+var precipSI = precipAbsDev.divide(precipMean.multiply(12))
+  .rename('precip_seasonality_index');
+
+// Final mask — locked at 0.55
+var tropicalMaskRaw = minTmax.gt(25.0)
+  .and(tmaxRange.lt(10.5))
+  .and(precipSI.lt(0.55))
+  .and(maxVSW.gt(0.27))
+  .or(
+    vswRange.lt(0.18)
+      .and(tmaxRange.lt(12.0))
+      .and(minTmax.gt(24.0))
+      .and(maxVSW.gt(0.28))
+      .and(precipSI.lt(0.55))
+  )
+  .rename('tropical_mask');
+
+// Land mask only (crisp)
+var landMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .first().select('soil_temperature_level_1').mask();
+
+var tropicalMask = tropicalMaskRaw
+  .updateMask(landMask)
+  .rename('tropical_mask');
+
+// Full image for export
+var fullImage = tmaxRange
+  .addBands(minTmax)
+  .addBands(vswRange)
+  .addBands(maxVSW)
+  .addBands(precipSI)
+  .addBands(tropicalMask)
+  .updateMask(landMask);
+
+// Global region (antimeridian-safe)
+var globalRegion = ee.Geometry.Polygon(
+  [[[-180, -60], [180, -60], [180, 75], [-180, 75]]], null, false);
+
+// Export to Asset
+Export.image.toAsset({
+  image: fullImage,
+  description: 'HybridGAEZAseasonalMask_1951_1980_FINAL',
+  assetId: 'projects/thermal-growing-seasons/assets/HybridGAEZAseasonalMask_1951_1980_FINAL',
+  scale: 11132,
+  region: globalRegion,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'sample'}
+});
+
+// Export to Google Drive
+Export.image.toDrive({
+  image: fullImage,
+  description: 'HybridTropicalMask_1951_1980_FINAL',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'HybridTropicalMask_1951_1980_FINAL',
+  scale: 11132,
+  region: globalRegion,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+Map.addLayer(tropicalMask, {palette: ['#440154', '#FDE725'], min:0, max:1}, 'Final Tropical Mask (precipSI < 0.55)');
+
+print('✅ FINAL PRODUCTION MASK EXPORT STARTED (1951–1980)');
+print('Asset: projects/thermal-growing-seasons/assets/HybridGAEZAseasonalMask_1951_1980_FINAL');
+print('Drive file: HybridTropicalMask_1951_1980_FINAL.tif');
