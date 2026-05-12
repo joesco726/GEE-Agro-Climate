@@ -80,9 +80,16 @@ var LMR_AGES = [
 // ── Masks ──────────────────────────────────────────────────────────────────
 var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg')
   .select(0).unmask(0);
-var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
-  .first().select('soil_temperature_level_1').mask().not();
-var computeMask = pureClimaticMask.and(oceanMask.not());
+// ERA5-Land native land mask from temperature_2m_min at a fixed date.
+// Using the same variable and collection as the frost calculations ensures
+// perfect consistency with what ERA5-Land will actually provide per pixel.
+// Direct land mask (no double negation) is more robust over SH ocean.
+var landMask = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
+  .filterDate('2000-01-01', '2001-01-01')
+  .first()
+  .select('temperature_2m_min')
+  .mask();
+var computeMask = pureClimaticMask.and(landMask);
 
 // ── Per-age frost static computation ──────────────────────────────────────
 // monthlyDelta: 12-band image, band index = month − 1 (0 = Jan, 11 = Dec), °C.
@@ -92,10 +99,13 @@ function computeFrostStaticForDelta(monthlyDelta) {
   var perYear = ee.ImageCollection(
     ee.List.sequence(START_YEAR, END_YEAR).map(function(y) {
 
-      // Monthly tmin_min for this year — loaded once, used in both windows.
+      // Monthly tmin_min masked to computeMask up-front. This propagates ocean /
+      // non-compute masking into monthGate, which is then applied inside the
+      // daily map() so lazy eval can skip ocean tile reads entirely.
       var monthlyTmin = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
         .filter(ee.Filter.calendarRange(y, y, 'year'))
-        .select('temperature_2m_min');
+        .select('temperature_2m_min')
+        .map(function(img) { return img.updateMask(computeMask); });
 
       // ── Spring: last frost DOY in spring window ────────────────────────
       var springLastFrostPerMonth = ee.ImageCollection(
