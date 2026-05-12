@@ -1,0 +1,159 @@
+// ======================================================
+// HEAT DROUGHT STATIC v2 — COMBINER VALIDATION
+// Spot-checks backward_sow_gdd (GDD0 + GDD10), season
+// boundaries, and validity masking at reference locations.
+//
+// PREREQUISITE: HeatDroughtStatic_{NH,SH}_v2 assets must
+// exist (run GDD_static_aggr_heat_combiner for each hemi).
+//
+// DOY interpretation:
+//   NH backward_sow values use wrapped DOY (CLOSE_DOY_WRAP_ADD=365):
+//     wrapped 245–365 = Aug 3 – Dec 31 of the sow year
+//     wrapped 366–545 = Jan 1 – Jun 30 of the following year (+1yr)
+//   SH uses raw DOY (no wrap); rabi window is May–Oct.
+//   backward_sow = 0 → validity-masked (rabi GDD budget < target).
+//
+// CLIENT-SIDE doyLabel() converts raw printed integers to dates.
+// Use in browser console after values arrive:
+//   doyLabel(355, 'NH')  →  "Dec 21"
+//   doyLabel(390, 'NH')  →  "(+1yr) Jan 25"
+//   doyLabel(0,   'NH')  →  "masked"
+// ======================================================
+
+// ── Assets ────────────────────────────────────────────────────────────────
+var nhStatic = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_NH_v2');
+var shStatic = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_SH_v2');
+
+print('NH bands:', nhStatic.bandNames());
+print('SH bands:', shStatic.bandNames());
+
+// ── Bands to sample ───────────────────────────────────────────────────────
+var BANDS = [
+  // Season boundaries
+  'heat_open_doy',                             // autumn cool onset
+  'heat_close_doy',                            // spring warm onset (mean)
+  'heat_close_doy_p20', 'heat_close_doy_p80',  // inter-annual spread
+  // Backward sow: v1 day-based (compatibility) vs v2 GDD-based
+  'backward_sow_irr',                          // v1: heat_close_mean + WRAP − 150d
+  'backward_sow_gdd0_p20', 'backward_sow_gdd0_p80',   // v2 GDD0 (wheat)
+  'backward_sow_gdd10_p20', 'backward_sow_gdd10_p80',  // v2 GDD10 (rice)
+  // Budget and implied season length (validity diagnostics)
+  'rabi_gdd0_budget', 'rabi_gdd10_budget',     // total seasonal GDD (°C·days)
+  'days_req_gdd0',    'days_req_gdd10',        // implied season length at clim rate
+  // Fallback quality
+  'heat_close_fallback_yrs'
+];
+
+// ── Reference points ──────────────────────────────────────────────────────
+// Selected to span: subtropical wheat, tropical dry-season rice,
+// arid dryland, Zone-2 marginal (expect mask), and SH wheat belts.
+var POINTS = [
+  // NH — subtropical wheat belts (GDD0 backward sow primary target)
+  { name: 'Tunis',              lon:  10.18, lat:  36.82, hemi: 'NH', note: 'Mediterranean wheat' },
+  { name: 'Nile Delta',         lon:  31.20, lat:  30.50, hemi: 'NH', note: 'Irrigated wheat Egypt' },
+  { name: 'Punjab / Lahore',    lon:  74.30, lat:  31.55, hemi: 'NH', note: 'Irrigated wheat Pakistan' },
+  { name: 'Baton Rouge',        lon: -91.15, lat:  30.45, hemi: 'NH', note: 'US Gulf subtropical wheat/small grain' },
+  // NH — tropical dry-season rice (GDD10 backward sow primary target)
+  { name: 'Hanoi / Red River',  lon: 105.80, lat:  21.00, hemi: 'NH', note: 'Dry-season rice; high GDD10 budget' },
+  { name: 'Bangkok / Chao P.',  lon: 100.52, lat:  13.75, hemi: 'NH', note: 'Dry-season rice; high GDD10 budget' },
+  { name: 'Cauvery Delta',      lon:  79.85, lat:  10.90, hemi: 'NH', note: 'Boro-type rice; both budgets pass' },
+  // NH — arid / dryland (GDD0 valid, GDD10 borderline)
+  { name: 'Hyderabad / Deccan', lon:  78.50, lat:  17.40, hemi: 'NH', note: 'Dryland Deccan; limited GDD10' },
+  // NH — Zone 2 marginal (expect backward_sow_gdd0 = 0)
+  { name: 'Astana / Kazakhstan',lon:  71.45, lat:  51.18, hemi: 'NH', note: 'Zone-2 marginal; expect masked' },
+  // SH — wheat belts (different rabi window May–Oct)
+  { name: 'Pampas / Rosario',   lon: -60.65, lat: -33.00, hemi: 'SH', note: 'SH wheat belt Argentina' },
+  { name: 'SW Australia',       lon: 116.00, lat: -31.90, hemi: 'SH', note: 'SH wheat belt W. Australia' }
+];
+
+// ── Build FeatureCollection ────────────────────────────────────────────────
+var nhFC = ee.FeatureCollection(
+  POINTS.filter(function(p) { return p.hemi === 'NH'; }).map(function(p) {
+    return ee.Feature(ee.Geometry.Point([p.lon, p.lat]),
+      { site: p.name, hemi: p.hemi, note: p.note });
+  })
+);
+var shFC = ee.FeatureCollection(
+  POINTS.filter(function(p) { return p.hemi === 'SH'; }).map(function(p) {
+    return ee.Feature(ee.Geometry.Point([p.lon, p.lat]),
+      { site: p.name, hemi: p.hemi, note: p.note });
+  })
+);
+
+// ── Sample ────────────────────────────────────────────────────────────────
+var nhSampled = nhStatic.select(BANDS).sampleRegions({
+  collection: nhFC, scale: 11132, geometries: false
+});
+var shSampled = shStatic.select(BANDS).sampleRegions({
+  collection: shFC, scale: 11132, geometries: false
+});
+
+// ── Table output (sortable in GEE console) ────────────────────────────────
+print('═══ NH validation table ═══', nhSampled);
+print('═══ SH validation table ═══', shSampled);
+
+// ── Per-point output (detailed view, easier for reading masking) ──────────
+var allSampled = nhSampled.merge(shSampled);
+allSampled.evaluate(function(fc) {
+  fc.features.forEach(function(f) {
+    var p = f.properties;
+    var site = p.site;
+    var hemi = p.hemi;
+
+    // Client-side DOY → date helper
+    var doyLabel = function(doy) {
+      if (doy === null || doy === undefined) return 'null';
+      if (doy === 0) return 'masked(0)';
+      var months  = [31,28,31,30,31,30,31,31,30,31,30,31];
+      var mNames  = ['Jan','Feb','Mar','Apr','May','Jun',
+                     'Jul','Aug','Sep','Oct','Nov','Dec'];
+      var prefix  = '';
+      var raw     = doy;
+      if (hemi === 'NH' && doy > 365) { raw = doy - 365; prefix = '(+1yr)'; }
+      raw = Math.round(raw);
+      var cum = 0;
+      for (var i = 0; i < 12; i++) {
+        if (raw <= cum + months[i]) {
+          return prefix + mNames[i] + '-' + (raw - cum);
+        }
+        cum += months[i];
+      }
+      return 'DOY' + doy;
+    };
+
+    // Sanity checks
+    var gdd0ok  = (p.rabi_gdd0_budget  || 0) >= 1500 ? '✓' : '✗ masked';
+    var gdd10ok = (p.rabi_gdd10_budget || 0) >= 1500 ? '✓' : '✗ masked';
+    // v1 vs v2 difference (days)
+    var diffGdd0 = (p.backward_sow_irr && p.backward_sow_gdd0_p20)
+      ? Math.round(p.backward_sow_gdd0_p20 - p.backward_sow_irr) : null;
+
+    print('── ' + site + ' [' + hemi + '] — ' + (p.note || ''));
+    print('   Season window  open=' + doyLabel(p.heat_open_doy)
+        + '  close(mean)=' + doyLabel(p.heat_close_doy)
+        + '  p20=' + doyLabel(p.heat_close_doy_p20)
+        + '  p80=' + doyLabel(p.heat_close_doy_p80));
+    print('   Backward sow (v1 day-based irr):  ' + doyLabel(p.backward_sow_irr));
+    print('   Backward sow GDD0  p20=' + doyLabel(p.backward_sow_gdd0_p20)
+        + '  p80=' + doyLabel(p.backward_sow_gdd0_p80)
+        + '  budget=' + Math.round(p.rabi_gdd0_budget) + ' GDD°  daysReq=' + p.days_req_gdd0
+        + '  valid=' + gdd0ok);
+    print('   Backward sow GDD10 p20=' + doyLabel(p.backward_sow_gdd10_p20)
+        + '  p80=' + doyLabel(p.backward_sow_gdd10_p80)
+        + '  budget=' + Math.round(p.rabi_gdd10_budget) + ' GDD°  daysReq=' + p.days_req_gdd10
+        + '  valid=' + gdd10ok);
+    if (diffGdd0 !== null) {
+      print('   GDD0 vs v1 sow shift: ' + (diffGdd0 > 0 ? '+' : '') + diffGdd0 + ' days'
+          + (Math.abs(diffGdd0) > 30 ? '  ← notable' : ''));
+    }
+    print('   Fallback close yrs: ' + p.heat_close_fallback_yrs + '/30');
+  });
+});
+
+// ── Optional: export table to Drive for spreadsheet review ────────────────
+// Uncomment to run:
+// Export.table.toDrive({
+//   collection: allSampled,
+//   description: 'HeatStatic_v2_validation',
+//   fileFormat: 'CSV'
+// });
