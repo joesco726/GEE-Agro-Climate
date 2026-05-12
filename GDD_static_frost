@@ -13,6 +13,8 @@
 //     lazy evaluation skips daily computation for those pixels,
 //     so only frost-possible pixels incur daily cost.
 //
+// Gate is applied inside the per-image map() so GEE's lazy
+// evaluator can skip tile reads before the reduce, not after.
 // In subtropical zones (bulk of the valid rabi mask area),
 // most spring months are frost-free → effective daily pixel
 // compute is a small fraction of the naive all-daily approach.
@@ -101,12 +103,12 @@ var perYear = ee.ImageCollection(
             var doy = ee.Image.constant(
               ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)
             ).toInt32();
-            return doy.updateMask(tminC.lt(0));
+            // Gate applied here so lazy eval can skip tile reads for frost-free pixels.
+            return doy.updateMask(tminC.lt(0)).updateMask(monthGate);
           })
           .reduce(ee.Reducer.max());
 
-        // Apply monthly gate: suppress daily result where month was frost-free.
-        return lastFrostDoyInMonth.updateMask(monthGate);
+        return lastFrostDoyInMonth;
       })
     );
 
@@ -134,11 +136,12 @@ var perYear = ee.ImageCollection(
             var doy = ee.Image.constant(
               ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)
             ).toInt32();
-            return doy.updateMask(tminC.lt(0));
+            // Gate applied here so lazy eval can skip tile reads for frost-free pixels.
+            return doy.updateMask(tminC.lt(0)).updateMask(monthGate);
           })
           .reduce(ee.Reducer.min());
 
-        return firstFrostDoyInMonth.updateMask(monthGate);
+        return firstFrostDoyInMonth;
       })
     );
 
