@@ -1,0 +1,248 @@
+// ======================================================
+// FROST STATIC (LIA) — Little Ice Age adjusted frost dates
+//
+// Delta method: ERA5-Land Tmin (1951–1980 modern baseline)
+// shifted per-pixel by LMR monthly temperature anomaly images
+// to approximate Little Ice Age thermal conditions.
+//
+// Each LMR asset is a 12-band image (band 0 = Jan, band 11 = Dec)
+// containing °C anomalies. For month m, delta_m is added to ERA5
+// Tmin before the 0°C frost threshold check — applied identically
+// to both the monthly gate (Pass 1) and each daily image (Pass 2).
+//
+// Five LIA ages processed (one Export task per age per hemisphere):
+//   RenAge  — Renaissance Age
+//   DiscAge — Discovery Age
+//   RefAge  — Reformation Age
+//   AbsAge  — Absolutism Age
+//   RevAge  — Revolution Age
+//
+// Output assets:
+//   projects/thermal-growing-seasons/assets/FrostStatic_LIA_{AgeName}_{HEMI}
+//
+// Each asset carries the same 6-band schema as FrostStatic_{HEMI}:
+//   last_spring_frost_mean   — mean last spring frost DOY
+//   last_spring_frost_p80    — p80 conservative bound (heading safe after this)
+//   first_autumn_frost_mean  — mean first autumn frost DOY
+//   first_autumn_frost_p20   — p20 conservative bound (harvest safe before this)
+//   spring_frost_years       — years (0–30) with spring frost detected
+//   autumn_frost_years       — years (0–30) with autumn frost detected
+//
+// Sentinels (no frost in window):
+//   NH: last_spring_frost = 0,   first_autumn_frost = 366
+//   SH: last_spring_frost = 366, first_autumn_frost = 0
+//
+// Two-pass design (same as FrostStatic_{HEMI}):
+//   Pass 1: monthly gate — MONTHLY_AGGR tmin + delta < 0°C?
+//   Pass 2: daily scan   — DAILY_AGGR tmin + delta, gate inside map()
+//   Gate is applied inside map() for earliest lazy-eval tile skipping.
+//
+// After all exports complete, assemble as ImageCollection — see bottom.
+// Change HEMISPHERE at top. Run once per hemisphere.
+// ======================================================
+
+var HEMISPHERE = 'NH';  // ←←← CHANGE TO 'NH' or 'SH'
+
+var HEMI_PARAMS = {
+  NH: {
+    SPRING_MONTHS: [1, 2, 3, 4, 5, 6],    // Jan–Jun
+    AUTUMN_MONTHS: [7, 8, 9, 10, 11, 12],  // Jul–Dec
+    NO_SPRING_FROST:  0,
+    NO_AUTUMN_FROST:  366,
+    REGION: ee.Geometry.Polygon([[
+      [-179.99, -10], [179.99, -10], [179.99, 75], [-179.99, 75]
+    ]], null, false)
+  },
+  SH: {
+    SPRING_MONTHS: [7, 8, 9, 10, 11, 12],  // Jul–Dec (SH spring end)
+    AUTUMN_MONTHS: [1, 2, 3, 4, 5, 6],     // Jan–Jun (SH autumn start)
+    NO_SPRING_FROST:  366,
+    NO_AUTUMN_FROST:  0,
+    REGION: ee.Geometry.Polygon([[
+      [-179.99, -55], [179.99, -55], [179.99, 0], [-179.99, 0]
+    ]], null, false)
+  }
+};
+var P = HEMI_PARAMS[HEMISPHERE];
+
+var START_YEAR = 1951;
+var END_YEAR   = 1980;
+
+// ── LMR age definitions ────────────────────────────────────────────────────
+var LMR_AGES = [
+  { name: 'RenAge',  assetId: 'projects/thermal-growing-seasons/assets/LMR_tas_delta_RenAge'  },
+  { name: 'DiscAge', assetId: 'projects/thermal-growing-seasons/assets/LMR_tas_delta_DiscAge' },
+  { name: 'RefAge',  assetId: 'projects/thermal-growing-seasons/assets/LMR_tas_delta_RefAge'  },
+  { name: 'AbsAge',  assetId: 'projects/thermal-growing-seasons/assets/LMR_tas_delta_AbsAge'  },
+  { name: 'RevAge',  assetId: 'projects/thermal-growing-seasons/assets/LMR_tas_delta_RevAge'  }
+];
+
+// ── Masks ──────────────────────────────────────────────────────────────────
+var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg')
+  .select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .first().select('soil_temperature_level_1').mask().not();
+var computeMask = pureClimaticMask.and(oceanMask.not());
+
+// ── Per-age frost static computation ──────────────────────────────────────
+// monthlyDelta: 12-band image, band index = month − 1 (0 = Jan, 11 = Dec), °C.
+// Delta is added to ERA5 Tmin (converted to °C) before the 0°C threshold.
+function computeFrostStaticForDelta(monthlyDelta) {
+
+  var perYear = ee.ImageCollection(
+    ee.List.sequence(START_YEAR, END_YEAR).map(function(y) {
+
+      // Monthly tmin_min for this year — loaded once, used in both windows.
+      var monthlyTmin = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .select('temperature_2m_min');
+
+      // ── Spring: last frost DOY in spring window ────────────────────────
+      var springLastFrostPerMonth = ee.ImageCollection(
+        P.SPRING_MONTHS.map(function(m) {
+          var monthDelta = monthlyDelta.select([m - 1]);  // 0-indexed bands
+
+          // Pass 1 gate: was the coldest night in month m (adjusted) below 0°C?
+          var monthGate = monthlyTmin
+            .filter(ee.Filter.calendarRange(m, m, 'month'))
+            .first()
+            .subtract(273.15)
+            .add(monthDelta)
+            .lt(0);
+
+          // Pass 2: daily adjusted Tmin — gate inside map() for lazy eval.
+          return ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filter(ee.Filter.calendarRange(y, y, 'year'))
+            .filter(ee.Filter.calendarRange(m, m, 'month'))
+            .select('temperature_2m_min')
+            .map(function(img) {
+              var tminC = img.subtract(273.15).add(monthDelta);
+              var doy = ee.Image.constant(
+                ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)
+              ).toInt32();
+              return doy.updateMask(tminC.lt(0)).updateMask(monthGate);
+            })
+            .reduce(ee.Reducer.max());
+        })
+      );
+
+      var lastSpringFrost = springLastFrostPerMonth
+        .reduce(ee.Reducer.max())
+        .unmask(P.NO_SPRING_FROST)
+        .rename('last_spring_frost');
+
+      // ── Autumn: first frost DOY in autumn window ───────────────────────
+      var autumnFirstFrostPerMonth = ee.ImageCollection(
+        P.AUTUMN_MONTHS.map(function(m) {
+          var monthDelta = monthlyDelta.select([m - 1]);
+
+          var monthGate = monthlyTmin
+            .filter(ee.Filter.calendarRange(m, m, 'month'))
+            .first()
+            .subtract(273.15)
+            .add(monthDelta)
+            .lt(0);
+
+          return ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+            .filter(ee.Filter.calendarRange(y, y, 'year'))
+            .filter(ee.Filter.calendarRange(m, m, 'month'))
+            .select('temperature_2m_min')
+            .map(function(img) {
+              var tminC = img.subtract(273.15).add(monthDelta);
+              var doy = ee.Image.constant(
+                ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)
+              ).toInt32();
+              return doy.updateMask(tminC.lt(0)).updateMask(monthGate);
+            })
+            .reduce(ee.Reducer.min());
+        })
+      );
+
+      var firstAutumnFrost = autumnFirstFrostPerMonth
+        .reduce(ee.Reducer.min())
+        .unmask(P.NO_AUTUMN_FROST)
+        .rename('first_autumn_frost');
+
+      var hadSpringFrost = lastSpringFrost.neq(P.NO_SPRING_FROST).rename('had_spring_frost');
+      var hadAutumnFrost = firstAutumnFrost.neq(P.NO_AUTUMN_FROST).rename('had_autumn_frost');
+
+      return lastSpringFrost
+        .addBands(firstAutumnFrost)
+        .addBands(hadSpringFrost)
+        .addBands(hadAutumnFrost)
+        .updateMask(computeMask);
+    })
+  );
+
+  // ── 30-year statistics ─────────────────────────────────────────────────
+  var lastSpringFrostMean = perYear.select('last_spring_frost')
+    .reduce(ee.Reducer.mean()).round().rename('last_spring_frost_mean');
+
+  var lastSpringFrostP80 = perYear.select('last_spring_frost')
+    .reduce(ee.Reducer.percentile([80])).round().rename('last_spring_frost_p80');
+
+  var firstAutumnFrostMean = perYear.select('first_autumn_frost')
+    .reduce(ee.Reducer.mean()).round().rename('first_autumn_frost_mean');
+
+  var firstAutumnFrostP20 = perYear.select('first_autumn_frost')
+    .reduce(ee.Reducer.percentile([20])).round().rename('first_autumn_frost_p20');
+
+  var springFrostYears = perYear.select('had_spring_frost')
+    .reduce(ee.Reducer.sum()).toByte().rename('spring_frost_years');
+  var autumnFrostYears = perYear.select('had_autumn_frost')
+    .reduce(ee.Reducer.sum()).toByte().rename('autumn_frost_years');
+
+  return lastSpringFrostMean
+    .addBands(lastSpringFrostP80)
+    .addBands(firstAutumnFrostMean)
+    .addBands(firstAutumnFrostP20)
+    .addBands(springFrostYears)
+    .addBands(autumnFrostYears)
+    .unmask(0)
+    .clip(P.REGION);
+}
+
+// ── Launch one Export task per age ─────────────────────────────────────────
+LMR_AGES.forEach(function(age) {
+  var monthlyDelta = ee.Image(age.assetId);
+  var frostStatic  = computeFrostStaticForDelta(monthlyDelta);
+
+  Export.image.toAsset({
+    image: frostStatic,
+    description: 'FrostStatic_LIA_' + age.name + '_' + HEMISPHERE,
+    assetId: 'projects/thermal-growing-seasons/assets/FrostStatic_LIA_' + age.name + '_' + HEMISPHERE,
+    scale: 11132,
+    region: P.REGION,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13,
+    pyramidingPolicy: { '.default': 'sample' }
+  });
+
+  print('✅ Export queued: FrostStatic_LIA_' + age.name + '_' + HEMISPHERE);
+});
+
+print('Hemisphere : ' + HEMISPHERE);
+print('Baseline   : ERA5-Land Tmin ' + START_YEAR + '–' + END_YEAR + ' + LMR monthly delta (°C)');
+print('Ages       : ' + LMR_AGES.map(function(a) { return a.name; }).join(', '));
+print('Method     : monthly gate (MONTHLY_AGGR tmin + delta) → daily precision (DAILY_AGGR tmin + delta).');
+print('Gate inside map() — lazy eval skips tile reads for frost-free pixels before reduce.');
+print('Bands per asset:');
+print('  last_spring_frost_mean / p80    first_autumn_frost_mean / p20');
+print('  spring_frost_years              autumn_frost_years');
+print('Reliability: DOY bands unreliable where frost_years < 5; sentinel-only where = 0.');
+print('Spring months : ' + P.SPRING_MONTHS.join(', '));
+print('Autumn months : ' + P.AUTUMN_MONTHS.join(', '));
+
+// ── Assemble as ImageCollection after all exports complete ─────────────────
+// Run in a separate script or tab once all 5 assets are ingested.
+//
+// var liaFrost = ee.ImageCollection(
+//   ['RenAge', 'DiscAge', 'RefAge', 'AbsAge', 'RevAge'].map(function(name) {
+//     return ee.Image(
+//       'projects/thermal-growing-seasons/assets/FrostStatic_LIA_' + name + '_' + HEMISPHERE
+//     ).set('age_name', name);
+//   })
+// );
+// print('LIA frost collection:', liaFrost);
+// // Filter to a single age:
+// var renAgeFrost = liaFrost.filter(ee.Filter.eq('age_name', 'RenAge')).first();
