@@ -113,9 +113,10 @@ var perYear = ee.ImageCollection(
     );
 
     // Across all spring months: latest frost DOY this year.
+    // Left masked where no frost occurred — collection reducers will skip
+    // masked pixels so only frost-present years contribute to statistics.
     var lastSpringFrost = springLastFrostPerMonth
       .reduce(ee.Reducer.max())
-      .unmask(P.NO_SPRING_FROST)
       .rename('last_spring_frost');
 
     // ── Autumn: first day in autumn window where Tmin < 0°C ──────────────
@@ -147,12 +148,12 @@ var perYear = ee.ImageCollection(
 
     var firstAutumnFrost = autumnFirstFrostPerMonth
       .reduce(ee.Reducer.min())
-      .unmask(P.NO_AUTUMN_FROST)
       .rename('first_autumn_frost');
 
-    // Frost-occurred flags for frequency counting.
-    var hadSpringFrost = lastSpringFrost.neq(P.NO_SPRING_FROST).rename('had_spring_frost');
-    var hadAutumnFrost = firstAutumnFrost.neq(P.NO_AUTUMN_FROST).rename('had_autumn_frost');
+    // .mask() returns 1 where the reduce found frost (valid pixel), 0 where masked.
+    // The output of .mask() is itself fully unmasked, so 0-values are valid counts.
+    var hadSpringFrost = lastSpringFrost.mask().byte().rename('had_spring_frost');
+    var hadAutumnFrost = firstAutumnFrost.mask().byte().rename('had_autumn_frost');
 
     return lastSpringFrost
       .addBands(firstAutumnFrost)
@@ -163,26 +164,33 @@ var perYear = ee.ImageCollection(
 );
 
 // ── 30-year statistics ─────────────────────────────────────────────────────
+// Reducers skip masked pixels, so only years with actual frost contribute to
+// DOY statistics. Pixels never frosted stay masked after reduce → unmask with
+// sentinel so NH/SH conventions are preserved and downstream masking works.
 var lastSpringFrostMean = perYear.select('last_spring_frost')
-  .reduce(ee.Reducer.mean()).round().rename('last_spring_frost_mean');
+  .reduce(ee.Reducer.mean()).round()
+  .unmask(P.NO_SPRING_FROST).rename('last_spring_frost_mean');
 
-// p80: frost-free after this DOY in 80% of years → schedule heading after this.
+// p80: frost-free after this DOY in 80% of frost years → schedule heading after this.
 var lastSpringFrostP80 = perYear.select('last_spring_frost')
-  .reduce(ee.Reducer.percentile([80])).round().rename('last_spring_frost_p80');
+  .reduce(ee.Reducer.percentile([80])).round()
+  .unmask(P.NO_SPRING_FROST).rename('last_spring_frost_p80');
 
 var firstAutumnFrostMean = perYear.select('first_autumn_frost')
-  .reduce(ee.Reducer.mean()).round().rename('first_autumn_frost_mean');
+  .reduce(ee.Reducer.mean()).round()
+  .unmask(P.NO_AUTUMN_FROST).rename('first_autumn_frost_mean');
 
-// p20: harvest safe before this DOY in 80% of years (frost arrives after p20
-// in 80% of years → symmetric conservative bound to last_spring_frost_p80).
+// p20: conservative early bound — frost arrives after this DOY in 80% of frost years.
 var firstAutumnFrostP20 = perYear.select('first_autumn_frost')
-  .reduce(ee.Reducer.percentile([20])).round().rename('first_autumn_frost_p20');
+  .reduce(ee.Reducer.percentile([20])).round()
+  .unmask(P.NO_AUTUMN_FROST).rename('first_autumn_frost_p20');
 
-// Frost frequency: count of years with any frost detected in each window.
+// Frost frequency: count of frost years (0–30). had_* are 0/1 and always unmasked
+// within computeMask, so sum is correct whether or not frost occurred.
 var springFrostYears = perYear.select('had_spring_frost')
-  .reduce(ee.Reducer.sum()).toByte().rename('spring_frost_years');
+  .reduce(ee.Reducer.sum()).toByte().unmask(0).rename('spring_frost_years');
 var autumnFrostYears = perYear.select('had_autumn_frost')
-  .reduce(ee.Reducer.sum()).toByte().rename('autumn_frost_years');
+  .reduce(ee.Reducer.sum()).toByte().unmask(0).rename('autumn_frost_years');
 
 // ── Final image ────────────────────────────────────────────────────────────
 var frostStatic = lastSpringFrostMean

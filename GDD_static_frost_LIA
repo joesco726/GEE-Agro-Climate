@@ -126,9 +126,10 @@ function computeFrostStaticForDelta(monthlyDelta) {
         })
       );
 
+      // Left masked where no frost occurred — collection reducers skip masked
+      // pixels so only frost-present years contribute to statistics.
       var lastSpringFrost = springLastFrostPerMonth
         .reduce(ee.Reducer.max())
-        .unmask(P.NO_SPRING_FROST)
         .rename('last_spring_frost');
 
       // ── Autumn: first frost DOY in autumn window ───────────────────────
@@ -158,13 +159,16 @@ function computeFrostStaticForDelta(monthlyDelta) {
         })
       );
 
+      // Left masked where no frost occurred — collection reducers skip masked
+      // pixels so only frost-present years contribute to statistics.
       var firstAutumnFrost = autumnFirstFrostPerMonth
         .reduce(ee.Reducer.min())
-        .unmask(P.NO_AUTUMN_FROST)
         .rename('first_autumn_frost');
 
-      var hadSpringFrost = lastSpringFrost.neq(P.NO_SPRING_FROST).rename('had_spring_frost');
-      var hadAutumnFrost = firstAutumnFrost.neq(P.NO_AUTUMN_FROST).rename('had_autumn_frost');
+      // .mask() gives 1 where frost found (valid pixel), 0 where no frost (masked).
+      // Output of .mask() is fully unmasked so 0-values are counted correctly.
+      var hadSpringFrost = lastSpringFrost.mask().byte().rename('had_spring_frost');
+      var hadAutumnFrost = firstAutumnFrost.mask().byte().rename('had_autumn_frost');
 
       return lastSpringFrost
         .addBands(firstAutumnFrost)
@@ -175,22 +179,31 @@ function computeFrostStaticForDelta(monthlyDelta) {
   );
 
   // ── 30-year statistics ─────────────────────────────────────────────────
+  // Reducers skip masked pixels, so only years with actual frost contribute to
+  // DOY statistics. Pixels never frosted stay masked after reduce → unmask with
+  // sentinel so NH/SH conventions are preserved and downstream masking works.
   var lastSpringFrostMean = perYear.select('last_spring_frost')
-    .reduce(ee.Reducer.mean()).round().rename('last_spring_frost_mean');
+    .reduce(ee.Reducer.mean()).round()
+    .unmask(P.NO_SPRING_FROST).rename('last_spring_frost_mean');
 
   var lastSpringFrostP80 = perYear.select('last_spring_frost')
-    .reduce(ee.Reducer.percentile([80])).round().rename('last_spring_frost_p80');
+    .reduce(ee.Reducer.percentile([80])).round()
+    .unmask(P.NO_SPRING_FROST).rename('last_spring_frost_p80');
 
   var firstAutumnFrostMean = perYear.select('first_autumn_frost')
-    .reduce(ee.Reducer.mean()).round().rename('first_autumn_frost_mean');
+    .reduce(ee.Reducer.mean()).round()
+    .unmask(P.NO_AUTUMN_FROST).rename('first_autumn_frost_mean');
 
   var firstAutumnFrostP20 = perYear.select('first_autumn_frost')
-    .reduce(ee.Reducer.percentile([20])).round().rename('first_autumn_frost_p20');
+    .reduce(ee.Reducer.percentile([20])).round()
+    .unmask(P.NO_AUTUMN_FROST).rename('first_autumn_frost_p20');
 
+  // had_* are 0/1 and always unmasked within computeMask, so sum is correct
+  // whether or not frost occurred.
   var springFrostYears = perYear.select('had_spring_frost')
-    .reduce(ee.Reducer.sum()).toByte().rename('spring_frost_years');
+    .reduce(ee.Reducer.sum()).toByte().unmask(0).rename('spring_frost_years');
   var autumnFrostYears = perYear.select('had_autumn_frost')
-    .reduce(ee.Reducer.sum()).toByte().rename('autumn_frost_years');
+    .reduce(ee.Reducer.sum()).toByte().unmask(0).rename('autumn_frost_years');
 
   return lastSpringFrostMean
     .addBands(lastSpringFrostP80)
