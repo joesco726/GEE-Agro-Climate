@@ -1,0 +1,169 @@
+// ======================================================
+// FROST STATIC — Last spring / first autumn frost dates
+// Pure air frost only: Tmin < 0°C (no soil temp or snow
+// confounding, unlike safeBegin in GDD_static_aggr).
+// Outputs mean and p80 DOY for each event, 1951–1980.
+// Change HEMISPHERE at top. Run once per hemisphere.
+//
+// last_spring_frost_p80: frost-free after this DOY in 80% of years.
+//   → schedule wheat heading AFTER this date for 80% safety.
+// first_autumn_frost_p80: frost has arrived by this DOY in 80% of years.
+//   → schedule harvest to complete BEFORE this date for 80% safety.
+//
+// Sentinel values (no frost found in window):
+//   last_spring_frost  = 0   (spring is always frost-free; no constraint)
+//   first_autumn_frost = 366 (autumn never frosted; no constraint)
+// ======================================================
+
+var HEMISPHERE = 'NH';  // ←←← CHANGE TO 'NH' or 'SH'
+
+var HEMI_PARAMS = {
+  NH: {
+    // Spring = Jan–Jun (DOY 1–181, before Jul 1 pivot)
+    // Autumn = Jul–Dec (DOY 183–365, after pivot)
+    SPRING_MIN_DOY: 1,   SPRING_MAX_DOY: 181,
+    AUTUMN_MIN_DOY: 183, AUTUMN_MAX_DOY: 365,
+    NO_SPRING_FROST:  0,    // unmask sentinel: spring always frost-free
+    NO_AUTUMN_FROST:  366,  // unmask sentinel: autumn never frosted
+    REGION: ee.Geometry.Polygon([[
+      [-179.99, -10], [179.99, -10], [179.99, 75], [-179.99, 75]
+    ]], null, false)
+  },
+  SH: {
+    // SH spring = Jul–Dec (DOY 183–365, post-pivot = SH winter→spring end)
+    // SH autumn = Jan–Jun (DOY 1–181, pre-pivot = SH late-summer→early-autumn)
+    SPRING_MIN_DOY: 183, SPRING_MAX_DOY: 365,
+    AUTUMN_MIN_DOY: 1,   AUTUMN_MAX_DOY: 181,
+    NO_SPRING_FROST:  366,
+    NO_AUTUMN_FROST:  0,
+    REGION: ee.Geometry.Polygon([[
+      [-179.99, -55], [179.99, -55], [179.99, 0], [-179.99, 0]
+    ]], null, false)
+  }
+};
+var P = HEMI_PARAMS[HEMISPHERE];
+
+var START_YEAR = 1951;
+var END_YEAR   = 1980;
+
+// ── Masks (consistent with GDD_static_aggr_heat batch runner) ──────────────
+var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg')
+  .select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .first().select('soil_temperature_level_1').mask().not();
+var computeMask = pureClimaticMask.and(oceanMask.not());
+
+// ── Per-year frost DOY computation ─────────────────────────────────────────
+var perYear = ee.ImageCollection(
+  ee.List.sequence(START_YEAR, END_YEAR).map(function(y) {
+    var daily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .select('temperature_2m_min');
+
+    var withDoyFrost = daily.map(function(img) {
+      var tminC = img.select('temperature_2m_min').subtract(273.15);
+      var doy = ee.Image.constant(
+        ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1)
+      ).toInt32().rename('doy');
+      return doy.addBands(tminC.lt(0).rename('frost'));
+    });
+
+    // Last spring frost: latest DOY in spring window where frost occurred.
+    // Unmask to NO_SPRING_FROST where no frost found (spring safe all year).
+    var lastSpringFrost = withDoyFrost
+      .filter(ee.Filter.calendarRange(P.SPRING_MIN_DOY, P.SPRING_MAX_DOY, 'day_of_year'))
+      .map(function(img) {
+        return img.select('doy').updateMask(img.select('frost'));
+      })
+      .reduce(ee.Reducer.max())
+      .unmask(P.NO_SPRING_FROST)
+      .rename('last_spring_frost');
+
+    // First autumn frost: earliest DOY in autumn window where frost occurred.
+    // Unmask to NO_AUTUMN_FROST where no frost found (autumn never frosted).
+    var firstAutumnFrost = withDoyFrost
+      .filter(ee.Filter.calendarRange(P.AUTUMN_MIN_DOY, P.AUTUMN_MAX_DOY, 'day_of_year'))
+      .map(function(img) {
+        return img.select('doy').updateMask(img.select('frost'));
+      })
+      .reduce(ee.Reducer.min())
+      .unmask(P.NO_AUTUMN_FROST)
+      .rename('first_autumn_frost');
+
+    // Frost-occurred flags for frequency counting (before unmask, using sentinels).
+    // NH: spring frost sentinel=0, so frostOccurred = last_spring_frost > 0.
+    // SH: spring frost sentinel=366, so frostOccurred = last_spring_frost < 366.
+    // Both reduce to: neq(sentinel), which works for all sentinel values ≥ 0.
+    var hadSpringFrost = lastSpringFrost.neq(P.NO_SPRING_FROST).rename('had_spring_frost');
+    var hadAutumnFrost = firstAutumnFrost.neq(P.NO_AUTUMN_FROST).rename('had_autumn_frost');
+
+    return lastSpringFrost
+      .addBands(firstAutumnFrost)
+      .addBands(hadSpringFrost)
+      .addBands(hadAutumnFrost)
+      .updateMask(computeMask);
+  })
+);
+
+// ── 30-year statistics ─────────────────────────────────────────────────────
+var lastSpringFrostMean = perYear.select('last_spring_frost')
+  .reduce(ee.Reducer.mean()).round().rename('last_spring_frost_mean');
+
+// p80: in 80% of years the last spring frost was on or before this DOY.
+// Schedule heading AFTER this date for 80% frost safety.
+var lastSpringFrostP80 = perYear.select('last_spring_frost')
+  .reduce(ee.Reducer.percentile([80])).round().rename('last_spring_frost_p80');
+
+var firstAutumnFrostMean = perYear.select('first_autumn_frost')
+  .reduce(ee.Reducer.mean()).round().rename('first_autumn_frost_mean');
+
+// p20: in 80% of years the first autumn frost arrived AFTER this DOY.
+// Symmetric conservative bound to last_spring_frost_p80:
+//   schedule harvest to complete BEFORE this date for 80% safety.
+var firstAutumnFrostP20 = perYear.select('first_autumn_frost')
+  .reduce(ee.Reducer.percentile([20])).round().rename('first_autumn_frost_p20');
+
+// Frost frequency: count of years (out of 30) where frost was actually detected
+// in each window. Pixels with spring_frost_years < 15 (< 50% of years) have
+// unreliable last_spring_frost statistics; pixels with spring_frost_years = 0
+// are genuinely frost-free in spring and the DOY bands are sentinels only.
+var springFrostYears = perYear.select('had_spring_frost')
+  .reduce(ee.Reducer.sum()).toByte().rename('spring_frost_years');
+var autumnFrostYears = perYear.select('had_autumn_frost')
+  .reduce(ee.Reducer.sum()).toByte().rename('autumn_frost_years');
+
+// ── Final image ────────────────────────────────────────────────────────────
+var frostStatic = lastSpringFrostMean
+  .addBands(lastSpringFrostP80)
+  .addBands(firstAutumnFrostMean)
+  .addBands(firstAutumnFrostP20)
+  .addBands(springFrostYears)
+  .addBands(autumnFrostYears)
+  .unmask(0)
+  .clip(P.REGION);
+
+// ── Export ─────────────────────────────────────────────────────────────────
+Export.image.toAsset({
+  image: frostStatic,
+  description: 'FrostStatic_1951_1980_' + HEMISPHERE,
+  assetId: 'projects/thermal-growing-seasons/assets/FrostStatic_' + HEMISPHERE,
+  scale: 11132,
+  region: P.REGION,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  pyramidingPolicy: {'.default': 'sample'}
+});
+
+print('✅ Frost static started for ' + HEMISPHERE);
+print('Asset: projects/thermal-growing-seasons/assets/FrostStatic_' + HEMISPHERE);
+print('Bands:');
+print('  last_spring_frost_mean  — mean DOY of last Tmin<0°C in spring window');
+print('  last_spring_frost_p80   — p80: heading safe after this DOY in 80% of years');
+print('  first_autumn_frost_mean — mean DOY of first Tmin<0°C in autumn window');
+print('  first_autumn_frost_p20  — p20: harvest safe before this DOY in 80% of years');
+print('  spring_frost_years      — count of years (0–30) with any spring frost detected');
+print('  autumn_frost_years      — count of years (0–30) with any autumn frost detected');
+print('Reliability: DOY bands unreliable where frost_years < 15; sentinel-only where frost_years = 0');
+print('Spring window : DOY ' + P.SPRING_MIN_DOY + '–' + P.SPRING_MAX_DOY);
+print('Autumn window : DOY ' + P.AUTUMN_MIN_DOY + '–' + P.AUTUMN_MAX_DOY);
+print('NH sentinels: last_spring_frost=0 → no spring frost; first_autumn_frost=366 → no autumn frost');

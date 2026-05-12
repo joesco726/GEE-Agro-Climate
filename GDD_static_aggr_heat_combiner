@@ -1,8 +1,13 @@
 // ======================================================
-// HEAT / DROUGHT STATIC LAYERS v2 — COMBINER
+// HEAT / DROUGHT STATIC LAYERS v3 — COMBINER
 // Combines 3 decadal batch images into final static.
-// v2 adds GDD-based backward sow bands (p20 + p80, both GDD0 and GDD10).
-// Climatological GDD rate × per-year heat_close → p20/p80 spread.
+// v2: GDD-based backward sow (GDD0 + GDD10, p20 + p80, validity masks).
+// v3: Frost scheduling bands from FrostStatic_{HEMI} asset.
+//     frost_safe_sow_min — earliest GDD0 sow that clears heading past
+//       last_spring_frost_p80 (80% frost-safe at anthesis).
+//     sow_window_days_gdd0 — viable sow window width (days): positive
+//       means heat and frost bounds don't overlap.
+// PREREQUISITE: run GDD_static_frost for this hemisphere first.
 // Change HEMISPHERE at the top. Run once per hemisphere.
 // ======================================================
 
@@ -38,10 +43,24 @@ var EXPECTED_SEASON_DAYS = 150;
 var GDD0_TARGET  = 1500;
 var GDD10_TARGET = 1500;
 
+// ── Frost scheduling parameters ────────────────────────────────────────────
+// HEADING_FRACTION: fraction of total season length elapsed at heading for
+// non-vernalizing subtropical spring wheat. Heading at ~72% of season.
+// Used to count backward from last_spring_frost_p80 to frost_safe_sow_min.
+var HEADING_FRACTION    = 0.72;
+// Days between last frost event and safe heading (floret hardening margin).
+var FROST_HEADING_BUFFER = 14;
+
 var DAYS_IN_MONTH = {
   1: 31,  2: 28.25, 3: 31,  4: 30,  5: 31,  6: 30,
   7: 31,  8: 31,    9: 30, 10: 31, 11: 30, 12: 31
 };
+
+// ── Load batch outputs (from batch runner v1) ──────────────────────────────
+// ── Frost static (prerequisite: run GDD_static_frost first) ───────────────
+var frostStatic = ee.Image('projects/thermal-growing-seasons/assets/FrostStatic_' + HEMISPHERE);
+var frostLastSpringP80   = frostStatic.select('last_spring_frost_p80');
+var frostSpringYears     = frostStatic.select('spring_frost_years');
 
 // ── Load batch outputs (from batch runner v1) ──────────────────────────────
 var batch1951 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1951_1960');
@@ -174,6 +193,43 @@ var backwardSowGdd10P20 = heatCloseP20.add(P.CLOSE_DOY_WRAP_ADD)
 var backwardSowGdd10P80 = heatCloseP80.add(P.CLOSE_DOY_WRAP_ADD)
   .subtract(daysReqGdd10).round().updateMask(gdd10Valid).rename('backward_sow_gdd10_p80');
 
+// ── v3: Frost-constrained minimum sow date ─────────────────────────────────
+// frost_safe_sow_min: earliest sow date that places heading (at HEADING_FRACTION
+// of season) after last_spring_frost_p80 + FROST_HEADING_BUFFER.
+// In wrapped DOY space (same reference frame as backward_sow_gdd0):
+//   sow = frost_safe_heading − heading_lead + CLOSE_DOY_WRAP_ADD
+//   frost_safe_heading = last_spring_frost_p80 + FROST_HEADING_BUFFER
+//   heading_lead = round(HEADING_FRACTION × days_req_gdd0)
+//
+// Where spring_frost_years = 0 (never frosted): set to 0 (no constraint).
+// Where spring_frost_years < 5 (<17% frequency): frost stats are unreliable;
+//   band is still set but downstream logic should check spring_frost_years.
+//
+// Masked to gdd0Valid (same pixels where backward_sow_gdd0 is defined).
+var headingLeadDays  = daysReqGdd0.multiply(HEADING_FRACTION).round();
+var frostSafeHeading = frostLastSpringP80.add(FROST_HEADING_BUFFER);
+var frostConstraintExists = frostSpringYears.gt(0);
+
+var frostSafeSowMin = frostSafeHeading
+  .subtract(headingLeadDays)
+  .add(P.CLOSE_DOY_WRAP_ADD)
+  .round()
+  .updateMask(gdd0Valid)
+  .where(frostConstraintExists.not(), 0)   // 0 = no frost constraint at this pixel
+  .rename('frost_safe_sow_min');
+
+// sow_window_days_gdd0: gap (days) between frost floor and heat ceiling.
+// Uses backward_sow_gdd0_p20 (heat, 80% of years heat hasn't closed yet)
+// minus frost_safe_sow_min (frost, 80% of years frost has retreated).
+// Positive = viable sow window exists.
+// Zero or negative = frost-heat squeeze; this pixel has high scheduling risk.
+// Only meaningful where frost actually occurs (frostConstraintExists).
+var sowWindowDaysGdd0 = backwardSowGdd0P20
+  .subtract(frostSafeSowMin)
+  .round()
+  .updateMask(gdd0Valid.and(frostConstraintExists))
+  .rename('sow_window_days_gdd0');
+
 // ── Final image ────────────────────────────────────────────────────────────
 var staticLayers = heatOpenP20
   .addBands(moistureOpenP20)
@@ -193,6 +249,9 @@ var staticLayers = heatOpenP20
   .addBands(daysReqGdd10.toInt16())                                // v2 diagnostic
   .addBands(gdd0Sum.round().toInt16().rename('rabi_gdd0_budget'))  // v2 diagnostic: total seasonal GDD0 capacity
   .addBands(gdd10Sum.round().toInt16().rename('rabi_gdd10_budget'))// v2 diagnostic: total seasonal GDD10 capacity
+  .addBands(frostSafeSowMin)                                        // v3 frost floor (wrapped DOY; 0 = no frost constraint)
+  .addBands(sowWindowDaysGdd0)                                      // v3 viable sow window width (days; masked where no frost)
+  .addBands(frostSpringYears.rename('spring_frost_years'))          // v3 frost reliability (0–30 years with spring frost)
   .addBands(fallbackCounts)
   .unmask(0)
   .clip(P.REGION);
@@ -200,8 +259,8 @@ var staticLayers = heatOpenP20
 // ── Export ─────────────────────────────────────────────────────────────────
 Export.image.toAsset({
   image: staticLayers,
-  description: 'HeatDroughtStatic_1951_1980_' + HEMISPHERE + '_v2',
-  assetId: 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v2',
+  description: 'HeatDroughtStatic_1951_1980_' + HEMISPHERE + '_v3',
+  assetId: 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v3',
   scale: 11132,
   region: P.REGION,
   crs: 'EPSG:4326',
@@ -209,15 +268,15 @@ Export.image.toAsset({
   pyramidingPolicy: {'.default': 'sample'}
 });
 
-print('✅ Combiner v2 started for ' + HEMISPHERE);
-print('Asset: projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v2');
-print('New bands: heat_close_doy_p20, heat_close_doy_p80,');
-print('           backward_sow_gdd0_p20, backward_sow_gdd0_p80 (masked where rabi_gdd0_budget < GDD0_TARGET),');
-print('           backward_sow_gdd10_p20, backward_sow_gdd10_p80 (masked where rabi_gdd10_budget < GDD10_TARGET),');
-print('           mean_rabi_gdd0_rate, mean_rabi_gdd10_rate,');
-print('           days_req_gdd0, days_req_gdd10,');
-print('           rabi_gdd0_budget, rabi_gdd10_budget');
-print('Validity: backward_sow_gdd0=0 means gdd0_budget < ' + GDD0_TARGET + ' (zone cannot support target GDD0 crop)');
-print('          backward_sow_gdd10=0 means gdd10_budget < ' + GDD10_TARGET + ' (zone too cool for target GDD10 crop)');
+print('✅ Combiner v3 started for ' + HEMISPHERE);
+print('Asset: projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v3');
+print('v2 bands: heat_close_doy_p20/p80, backward_sow_gdd0/gdd10 p20/p80,');
+print('          mean_rabi_gdd0/gdd10_rate, days_req_gdd0/gdd10,');
+print('          rabi_gdd0/gdd10_budget (validity masks applied)');
+print('v3 bands: frost_safe_sow_min  — earliest GDD0 sow for 80%-frost-safe heading (0=no frost)');
+print('          sow_window_days_gdd0 — days between frost floor and heat ceiling (masked where no frost)');
+print('          spring_frost_years   — years (0–30) with spring frost; <5 = unreliable DOY stats');
+print('Frost heading parameters: HEADING_FRACTION=' + HEADING_FRACTION + ', FROST_HEADING_BUFFER=' + FROST_HEADING_BUFFER + 'd');
+print('Validity: backward_sow_gdd0=0 → gdd0_budget<' + GDD0_TARGET + '; backward_sow_gdd10=0 → gdd10_budget<' + GDD10_TARGET);
 print('Rabi GDD window: months ' + P.RABI_MONTHS.join(',') + ' (' + P.RABI_DAYS + ' days)');
 print('GDD targets: GDD0=' + GDD0_TARGET + ', GDD10=' + GDD10_TARGET);
