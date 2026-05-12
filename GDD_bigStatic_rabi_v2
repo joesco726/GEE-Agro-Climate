@@ -1,0 +1,698 @@
+// ======================================================
+// RABI/KHARIF PRECOMPUTE v2.0 — Full Two-Season, Two-Track Architecture
+// ======================================================
+// Architecture changes from v1.4 (44 bands → 57 bands):
+//
+// • Two seasons fully covered: rabi (cool-season, sown post-monsoon) AND
+//   kharif (warm-season, sown at monsoon onset). Symmetric per-year detection
+//   of sowing, harvest, and accumulation for both.
+//
+// • Two tracks per season: irrigated (no VSW constraint on sow/close,
+//   irrigation_demand_mm tracked instead of drought_fraction) and rainfed
+//   (VSW-constrained sow/close, drought_days as risk metric).
+//
+// • Both GDD bases per track: gdd0 (cool-season crops: wheat/barley/canola)
+//   AND gdd10 (warm-season crops: rice/maize/sorghum). Same composites,
+//   different base temperature subtraction. Generic climate signal —
+//   crop assignment via GAEZ in post-processing, not in this script.
+//
+// • Viability flags (binary): GDD target met within the resolved season.
+//
+// • Terminal code per track per season (0=window-end fallback, 1=GDD-met,
+//   2=heat terminal, 3=drought terminal, 4=frost terminal). Replaces
+//   the five separate fallback flag bands of v1.4.
+//
+// • Irrigation demand (mm) computed as season-sum of max(0, PET − Precip)
+//   per composite. Replaces the v1.4 pet_minus_precip diagnostic which
+//   could go negative.
+//
+// • Intercrop gap days: kharif sow − rabi harvest. Negative or near-zero
+//   indicates the rotation physically fails.
+//
+// • Kharif onset DOY detected per-year via VSW threshold crossing
+//   (analogue of rabi heat_open).
+//
+// • Static-only bands removed from annual output (mean_min_soil_c, vern_zone,
+//   mean_vernal_progress, heat_close, backward_sow). Load from static assets
+//   in analysis. The annual image now contains only year-varying signal.
+//
+// • Photoperiod weighting (wheat ppMod, rice ppMod) deferred to a
+//   post-processing layer. Annual output is generic GDD; downstream models
+//   apply cultivar-specific phenology.
+//
+// • Boro rice mask is GAEZ post-processing concern, not baked here.
+//   Tropical/aseasonal mask still excluded as before.
+//
+// Total output bands: 57
+// ======================================================
+
+var startYear = 1951;
+var endYear   = 1980;
+var EXPORT_TO_ASSET = true;
+var EXPORT_TO_DRIVE = true;
+
+// ======================================================
+// HEMISPHERE
+// ======================================================
+var HEMISPHERE = 'NH';
+var HEMI_PARAMS = {
+  NH: {
+    MONSOON_MIN_DOY: 265,    // ~22 Sep — global rabi-sow-search floor
+    SOW_SEARCH_END:  355,    // late Dec
+    SOW_FALLBACK_IRR: 290,
+    HARVEST_FALLBACK_D: 150, // sow + 150 ≈ rabi window end (used if no terminal fires)
+    KHARIF_FALLBACK_END: 300,// kharif window absolute end (DOY)
+    KHARIF_ONSET_SEARCH_START: 100, // ~10 Apr — earliest plausible kharif onset
+    KHARIF_ONSET_SEARCH_END:   220, // ~ 8 Aug — latest plausible
+    CROP_STATIC: 'projects/thermal-growing-seasons/assets/StaticCropLayerNH_v2',
+    GEOMETRY: ee.Geometry.Polygon([[[-180, 0], [180, 0], [180, 42], [-180, 42]]], null, false),
+    ASSET_SUFFIX: 'North',
+    PASS2_MIN_DOY: 1,        // kharif lives entirely within calendar year
+    SAFE_BEGIN_OFFSET: 365,
+    SAFE_END_FALLBACK: 364,
+    HEAT_CLOSE_WRAP_ADD: 365
+  },
+  SH: {
+    MONSOON_MIN_DOY: 95,     // ~5 Apr — global rabi-sow-search floor
+    SOW_SEARCH_END:  195,    // ~14 Jul
+    SOW_FALLBACK_IRR: 130,
+    HARVEST_FALLBACK_D: 220,
+    KHARIF_FALLBACK_END: 120,// kharif window absolute end (DOY) — wraps year, allow buffer
+    KHARIF_ONSET_SEARCH_START: 280, // ~ 7 Oct
+    KHARIF_ONSET_SEARCH_END:   30,  // ~30 Jan (wrapped)
+    CROP_STATIC: 'projects/thermal-growing-seasons/assets/StaticCropLayerSH_v2',
+    GEOMETRY: ee.Geometry.Polygon([[[-180, -40], [180, -40], [180, 0], [-180, 0]]], null, false),
+    ASSET_SUFFIX: 'South',
+    PASS2_MIN_DOY: 200,
+    SAFE_BEGIN_OFFSET: 0,
+    SAFE_END_FALLBACK: 181,
+    HEAT_CLOSE_WRAP_ADD: 0
+  }
+};
+var P = HEMI_PARAMS[HEMISPHERE];
+
+// ======================================================
+// PARAMETERS
+// ======================================================
+// --- Sowing onset (rabi) ---
+var RABI_SOW_TMAX_C       = 28.0;  // 8-day mean Tmax must drop below this
+var RABI_SOW_TMEAN_MAX_C  = 24.0;  // and 8-day mean Tmean below this
+var RABI_SOW_VSW_THRESH   = 0.22;  // and (rainfed only) VSW above
+var RABI_SOW_VSW_MIN_DAYS = 4;     // for at least this many days in the 8-day window
+
+// --- Sowing onset (kharif) ---
+var KHARIF_ONSET_VSW_THRESH = 0.22; // VSW threshold marking monsoon onset
+
+// --- Season terminals ---
+var RABI_HEAT_TERM_C    = 35.0;    // 8-day mean Tmax ≥ this terminates rabi season
+var KHARIF_HEAT_TERM_C  = 38.0;    // higher threshold — tropical crops tolerate more heat
+var VSW_TERMINAL_THRESH = 0.12;    // 8-day mean VSW < this terminates rainfed season
+var RABI_MIN_GROW_DAYS  = 60;      // terminals don't fire before this many days post-sow
+var KHARIF_MIN_GROW_DAYS = 60;
+
+// --- VSW weighting (0–28 cm root zone) ---
+var VSW_W1 = 0.30;
+var VSW_W2 = 0.70;
+
+// --- Stress / diagnostic thresholds ---
+var DROUGHT_VSW_THRESH = 0.20;     // daily flag for drought-day count
+var RABI_HEAT_STRESS_C = 34;       // daily flag for heat-day count (rabi)
+var KHARIF_HEAT_STRESS_C = 36;     // daily flag for heat-day count (kharif)
+
+// --- Irrigation demand (field capacity for water balance) ---
+// FC=0.30 m³/m³ is reasonable global average for agricultural soils (loam/clay-loam).
+// Irrigation demand uses the simpler PET−precip atmospheric water balance,
+// so FC is not currently used. TODO: integrate HiHydroSoil v2.0 field capacity
+// for a soil-aware deficit calculation.
+
+// --- GDD targets for viability flags ---
+var RABI_GDD0_TARGET    = 1600;    // wheat full-season GDD0 (base 0°C)
+var RABI_GDD10_TARGET   = 1500;    // boro rice GDD10 (base 10°C) — for tropical rabi
+var KHARIF_GDD10_TARGET = 1800;    // medium-duration indica rice GDD10
+var KHARIF_GDD0_TARGET  = 1500;    // spring wheat / cool-season crop in cool kharif zones
+
+// --- Logistics ---
+var TURNAROUND_DAYS = 40;          // rabi harvest → kharif sow gap (ploughing/prep)
+
+// --- Frost-safe sow constraint ---
+var HEADING_FRAC = 0.62;           // heading occurs at this fraction of season length
+
+// --- PTQ (yield-quality modifier) ---
+var PTQ_OPTIMAL    = 1.2;
+var PTQ_MIN_FACTOR = 0.60;
+var PTQ_MAX_FACTOR = 1.40;
+
+// ======================================================
+// STATIC ASSETS
+// ======================================================
+var statics       = ee.Image(P.CROP_STATIC);
+var meanMinSoilC  = statics.select('b1').rename('mean_min_soil_c');
+var safeBeginRaw  = statics.select('b2');
+var safeEndStatic = statics.select('b4');
+
+var vernStatic    = ee.Image('projects/northern-growing-seasons-v1/assets/vernalization_static_v3_PL');
+var meanVernProgress = vernStatic.select('b3').rename('mean_vernal_progress');
+var vernZone      = ee.Image('projects/northern-growing-seasons-v1/assets/vernalization_zones')
+                      .toByte().rename('vern_zone');
+
+var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg')
+                         .select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR').first()
+                  .select('soil_temperature_level_1').mask().not();
+
+// Heat/Drought static v2 (30-yr climatology, this hemisphere).
+// v2 adds: heat_close_doy_p20, heat_close_doy_p80, backward_sow_gdd0_p20/p80,
+// backward_sow_gdd10_p20/p80, mean_rabi_gdd0/10_rate, days_req_gdd0/10.
+// Disruption metric continues to use the day-based backward_sow_irr for
+// continuity with v1.4 semantics; downstream analysis can swap in the
+// GDD-based bands as needed.
+var heatStatic = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' +
+                          HEMISPHERE + '_v2');
+var heatOpenStatic     = heatStatic.select('heat_open_doy');
+var heatCloseStaticDOY = heatStatic.select('heat_close_doy')
+                          .add(P.HEAT_CLOSE_WRAP_ADD).round().rename('rabi_heat_close_doy');
+var backwardSowStatic  = heatStatic.select('backward_sow_irr')
+                          .round().rename('rabi_backward_sow_irr');
+
+// Tropical/aseasonal mask (precipSI < 0.55, low thermal range).
+// Hard-excluded: single-cool-season detection doesn't apply to aseasonal/bimodal regimes.
+var tropicalMask = ee.Image(
+  'projects/thermal-growing-seasons/assets/HybridGAEZAseasonalMask_1951_1980_FINAL')
+  .select('tropical_mask').unmask(0);
+
+var RABI_MASK = vernZone.gte(2)
+  .and(meanMinSoilC.gt(0))
+  .and(pureClimaticMask)
+  .and(oceanMask.not())
+  .and(tropicalMask.eq(0));
+
+var fullGeometry = P.GEOMETRY;
+
+// ======================================================
+// DAILY BAND DERIVATION
+// ======================================================
+var ERA5_BANDS = [
+  'temperature_2m_min', 'temperature_2m_max', 'temperature_2m',
+  'volumetric_soil_water_layer_1', 'volumetric_soil_water_layer_2',
+  'total_precipitation_sum', 'surface_solar_radiation_downwards_sum',
+  'potential_evaporation_sum'
+];
+
+var deriveDailyBands = function(img) {
+  var tminC  = img.select('temperature_2m_min').subtract(273.15);
+  var tmaxC  = img.select('temperature_2m_max').subtract(273.15);
+  var tmeanC = img.select('temperature_2m').subtract(273.15);
+  var vsw1   = img.select('volumetric_soil_water_layer_1');
+  var vsw2   = img.select('volumetric_soil_water_layer_2');
+  var vswComb = vsw1.multiply(VSW_W1).add(vsw2.multiply(VSW_W2));
+  var precipMm = img.select('total_precipitation_sum').multiply(1000);
+  var petMm    = img.select('potential_evaporation_sum').multiply(-1000).max(0);
+  var irrDeficitDaily = petMm.subtract(precipMm).max(0); // daily irrigation deficit (mm)
+  return ee.Image([
+    tmaxC, tmeanC,
+    tmeanC.max(0),                                   // gdd0
+    tmeanC.subtract(10).max(0),                      // gdd10
+    tmaxC.subtract(RABI_HEAT_STRESS_C).max(0),       // rabi heat-stress GDD (above 34)
+    tmaxC.subtract(KHARIF_HEAT_STRESS_C).max(0),     // kharif heat-stress GDD (above 36)
+    precipMm,
+    petMm,
+    irrDeficitDaily,                                 // max(0, PET-precip)
+    img.select('surface_solar_radiation_downwards_sum').divide(1e6),
+    vswComb,
+    vsw1.gte(RABI_SOW_VSW_THRESH).toByte(),          // sow VSW flag
+    vswComb.lt(DROUGHT_VSW_THRESH).toByte(),         // drought day flag
+    tminC.lt(0).toByte(),                            // frost day flag (0°C)
+    tmaxC.gte(RABI_HEAT_TERM_C).toByte(),            // rabi heat-term day flag
+    tmaxC.gte(KHARIF_HEAT_TERM_C).toByte()           // kharif heat-term day flag
+  ]).rename(['tmax_c','tmean_c',
+             'gdd0','gdd10',
+             'rabi_heat_gdd','kharif_heat_gdd',
+             'precip_mm','pet_mm','irr_deficit_mm',
+             'solar_mj','vsw_combined',
+             'vsw_sow_ok','drought_day','frost_day',
+             'rabi_heat_day','kharif_heat_day'])
+    .set('system:time_start', img.get('system:time_start'));
+};
+
+// ======================================================
+// 8-DAY COMPOSITES (server-side map for graph compaction)
+// ======================================================
+var make8DayComposites = function(derived, year) {
+  year = ee.Number(year);
+  var colYear = derived.filter(ee.Filter.calendarRange(year, year, 'year'));
+
+  var buildAtDoy = function(startDoy) {
+    startDoy = ee.Number(startDoy);
+    var rawDoy = startDoy.mod(365).max(1);
+    var window = colYear.filter(ee.Filter.calendarRange(rawDoy, rawDoy.add(7), 'day_of_year'));
+    var sums = window
+      .select(['gdd0','gdd10','rabi_heat_gdd','kharif_heat_gdd',
+               'precip_mm','pet_mm','irr_deficit_mm','solar_mj',
+               'vsw_sow_ok','drought_day','frost_day',
+               'rabi_heat_day','kharif_heat_day'])
+      .reduce(ee.Reducer.sum())
+      .rename(['gdd0_sum','gdd10_sum','rabi_heat_gdd_sum','kharif_heat_gdd_sum',
+               'precip_sum_mm','pet_sum_mm','irr_deficit_sum_mm','solar_mj_sum',
+               'vsw_sow_days','drought_days','frost_days',
+               'rabi_heat_days','kharif_heat_days']);
+    var means = window.select(['tmax_c','tmean_c','vsw_combined'])
+      .reduce(ee.Reducer.mean())
+      .rename(['tmax_mean_c','tmean_c','vsw_combined_mean']);
+    return sums.addBands(means)
+      .addBands(ee.Image.constant(startDoy).toFloat().rename('start_doy'))
+      .set('start_doy', startDoy);
+  };
+
+  var allDoys = ee.List.sequence(1, 361, 8).cat(ee.List.sequence(366, 726, 8));
+  return ee.ImageCollection(allDoys.map(buildAtDoy));
+};
+
+// ======================================================
+// PER-YEAR METRICS
+// ======================================================
+var computeYearMetrics = function(year) {
+  year = ee.Number(year);
+  var derived = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .select(ERA5_BANDS)
+    .map(deriveDailyBands);
+
+  var allComposites = make8DayComposites(derived, year);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // RABI SOWING — irrigated and rainfed tracks
+  // ─────────────────────────────────────────────────────────────────────
+  // Irrigated: temperature constraint only (sow when cool enough).
+  // Rainfed: temperature AND moisture constraint (cool AND wet enough).
+  // Both gated by climatological heat_open (P20) — sowing earlier than the
+  // climatological cooling onset is unrealistic regardless of irrigation.
+  var rabiSowSearch = allComposites.filter(ee.Filter.gte('start_doy', P.MONSOON_MIN_DOY));
+
+  var rabiSowReduce = rabiSowSearch.map(function(img) {
+    var doy     = img.select('start_doy');
+    var tmaxOK  = img.select('tmax_mean_c').lt(RABI_SOW_TMAX_C);
+    var tmeanOK = img.select('tmean_c').lt(RABI_SOW_TMEAN_MAX_C);
+    var tempOK  = tmaxOK.and(tmeanOK);
+    var doyOK   = doy.lte(P.SOW_SEARCH_END).and(doy.gte(heatOpenStatic));
+    var vswOK   = img.select('vsw_sow_days').gte(RABI_SOW_VSW_MIN_DAYS);
+    var sowIrr  = doy.updateMask(doyOK.and(tempOK)).rename('sow_irr');
+    var sowRain = doy.updateMask(doyOK.and(tempOK).and(vswOK)).rename('sow_rain');
+    return sowIrr.addBands(sowRain);
+  }).reduce(ee.Reducer.min());
+
+  var O_irr  = rabiSowReduce.select('sow_irr_min').unmask(P.SOW_FALLBACK_IRR).round();
+  var O_rain = rabiSowReduce.select('sow_rain_min').unmask(O_irr).round();
+
+  // Frost-safe sow constraint (from winter static).
+  var safeBeginWrapped = safeBeginRaw.add(P.SAFE_BEGIN_OFFSET);
+  var frostFree = safeEndStatic.eq(P.SAFE_END_FALLBACK);
+  var headingOffset = ee.Image.constant(Math.round(HEADING_FRAC * P.HARVEST_FALLBACK_D));
+  var frostSafeSow = safeBeginWrapped.subtract(headingOffset)
+    .where(frostFree, ee.Image.constant(0))
+    .max(0);
+
+  var rabiSowIrr  = O_irr.max(frostSafeSow).round().rename('rabi_sow_irr');
+  var rabiSowRain = O_rain.max(frostSafeSow).unmask(rabiSowIrr).round().rename('rabi_sow_rain');
+
+  // ─────────────────────────────────────────────────────────────────────
+  // RABI HARVEST — terminal detection per track
+  // ─────────────────────────────────────────────────────────────────────
+  // For each track, find first composite (after MIN_GROW) where each terminal
+  // type fires. Harvest = min of fired terminals; if none fire, fall back
+  // to sow + HARVEST_FALLBACK_D.
+  var rabiTermReduce = allComposites.map(function(img) {
+    var doy  = img.select('start_doy');
+    var tmax = img.select('tmax_mean_c');
+    var vsw  = img.select('vsw_combined_mean');
+    var frostFlag = img.select('frost_days').gte(1);
+    var afterMinIrr  = doy.gt(rabiSowIrr.add(RABI_MIN_GROW_DAYS));
+    var afterMinRain = doy.gt(rabiSowRain.add(RABI_MIN_GROW_DAYS));
+    var heatIrr  = doy.updateMask(afterMinIrr.and(tmax.gte(RABI_HEAT_TERM_C))).rename('heat_irr');
+    var heatRain = doy.updateMask(afterMinRain.and(tmax.gte(RABI_HEAT_TERM_C))).rename('heat_rain');
+    var frostIrr  = doy.updateMask(afterMinIrr.and(frostFlag)).rename('frost_irr');
+    var frostRain = doy.updateMask(afterMinRain.and(frostFlag)).rename('frost_rain');
+    var droughtRain = doy.updateMask(afterMinRain.and(vsw.lt(VSW_TERMINAL_THRESH))).rename('drought_rain');
+    return heatIrr.addBands([heatRain, frostIrr, frostRain, droughtRain]);
+  }).reduce(ee.Reducer.min());
+
+  var rabiFallbackHarvIrr  = rabiSowIrr.add(P.HARVEST_FALLBACK_D);
+  var rabiFallbackHarvRain = rabiSowRain.add(P.HARVEST_FALLBACK_D);
+
+  var heatTermIrr   = rabiTermReduce.select('heat_irr_min').unmask(99999);
+  var frostTermIrr  = rabiTermReduce.select('frost_irr_min').unmask(99999);
+  var heatTermRain  = rabiTermReduce.select('heat_rain_min').unmask(99999);
+  var frostTermRain = rabiTermReduce.select('frost_rain_min').unmask(99999);
+  var droughtTermRain = rabiTermReduce.select('drought_rain_min').unmask(99999);
+
+  var rabiHarvestIrr  = heatTermIrr.min(frostTermIrr).min(rabiFallbackHarvIrr)
+                          .round().rename('rabi_harvest_irr');
+  var rabiHarvestRain = heatTermRain.min(frostTermRain).min(droughtTermRain)
+                          .min(rabiFallbackHarvRain).round().rename('rabi_harvest_rain');
+
+  var rabiSeasonLenIrr  = rabiHarvestIrr.subtract(rabiSowIrr).max(0).rename('rabi_season_len_irr');
+  var rabiSeasonLenRain = rabiHarvestRain.subtract(rabiSowRain).max(0).rename('rabi_season_len_rain');
+
+  // ─────────────────────────────────────────────────────────────────────
+  // RABI ACCUMULATION — both tracks, both GDD bases, stress, irrigation, PTQ
+  // ─────────────────────────────────────────────────────────────────────
+  var rabiHeading = rabiSowIrr.add(rabiSeasonLenIrr.multiply(HEADING_FRAC).round());
+
+  var rabiPass = allComposites.map(function(img) {
+    var doy = img.select('start_doy');
+    var inIrr     = doy.gte(rabiSowIrr).and(doy.lt(rabiHarvestIrr));
+    var inRain    = doy.gte(rabiSowRain).and(doy.lt(rabiHarvestRain));
+    var inGfIrr   = doy.gte(rabiHeading).and(doy.lt(rabiHarvestIrr));
+    var inGfRain  = doy.gte(rabiHeading).and(doy.lt(rabiHarvestRain));
+    return ee.Image([
+      img.select('gdd0_sum').multiply(inIrr),
+      img.select('gdd10_sum').multiply(inIrr),
+      img.select('gdd0_sum').multiply(inRain),
+      img.select('gdd10_sum').multiply(inRain),
+      img.select('rabi_heat_days').multiply(inIrr),
+      img.select('rabi_heat_days').multiply(inRain),
+      img.select('drought_days').multiply(inRain),
+      img.select('frost_days').multiply(inIrr),
+      img.select('frost_days').multiply(inRain),
+      img.select('irr_deficit_sum_mm').multiply(inIrr),
+      img.select('precip_sum_mm').multiply(inRain),
+      img.select('vsw_combined_mean').multiply(inRain),
+      inRain.toFloat(),                                     // count of in-window composites for VSW mean
+      img.select('solar_mj_sum').multiply(inGfIrr),
+      img.select('tmean_c').multiply(inGfIrr),
+      inGfIrr.toFloat()
+    ]).unmask(0);
+  }).reduce(ee.Reducer.sum()).rename([
+    'gdd0_irr','gdd10_irr','gdd0_rain','gdd10_rain',
+    'heat_days_irr','heat_days_rain','drought_days_rain',
+    'frost_days_irr','frost_days_rain',
+    'irrigation_mm_irr','precip_rabi_mm','vsw_sum_rain','vsw_count_rain',
+    'ptq_solar','ptq_tmean','ptq_count'
+  ]);
+
+  var rabiGDD0_irr   = rabiPass.select('gdd0_irr').round().rename('rabi_gdd0_irr');
+  var rabiGDD0_rain  = rabiPass.select('gdd0_rain').round().rename('rabi_gdd0_rain');
+  var rabiGDD10_irr  = rabiPass.select('gdd10_irr').round().rename('rabi_gdd10_irr');
+  var rabiGDD10_rain = rabiPass.select('gdd10_rain').round().rename('rabi_gdd10_rain');
+
+  var rabiHeatDaysIrr  = rabiPass.select('heat_days_irr').toInt16().rename('rabi_heat_days_irr');
+  var rabiHeatDaysRain = rabiPass.select('heat_days_rain').toInt16().rename('rabi_heat_days_rain');
+  var rabiDroughtDaysRain = rabiPass.select('drought_days_rain').toInt16().rename('rabi_drought_days_rain');
+  var rabiFrostDaysIrr  = rabiPass.select('frost_days_irr').toInt16().rename('rabi_frost_days_irr');
+  var rabiFrostDaysRain = rabiPass.select('frost_days_rain').toInt16().rename('rabi_frost_days_rain');
+  var rabiIrrMm = rabiPass.select('irrigation_mm_irr').round().toInt16().rename('rabi_irrigation_mm_irr');
+  var rabiPrecipMm = rabiPass.select('precip_rabi_mm').round().toInt16().rename('precip_rabi_mm');
+  var rabiVswMeanRain = rabiPass.select('vsw_sum_rain')
+                          .divide(rabiPass.select('vsw_count_rain').max(1))
+                          .multiply(1000).round().toInt16().rename('vsw_mean_rabi_rain');
+
+  // PTQ factor — wheat-style yield-quality modifier (grain-fill solar / grain-fill tmean).
+  // Same factor used for both tracks since PTQ is an atmospheric signal.
+  var ptqDays = rabiPass.select('ptq_count').multiply(8).max(1);
+  var ptqFactor = rabiPass.select('ptq_solar')
+    .divide(rabiPass.select('ptq_tmean').max(0.1).multiply(8))
+    .divide(PTQ_OPTIMAL).clamp(PTQ_MIN_FACTOR, PTQ_MAX_FACTOR)
+    .unmask(PTQ_MIN_FACTOR).multiply(100).round().toByte().rename('rabi_ptq');
+  var rabiPtqIrr  = ptqFactor.rename('rabi_ptq_irr');
+  var rabiPtqRain = ptqFactor.rename('rabi_ptq_rain');
+
+  // Viability flags — did the season's GDD reach the crop target?
+  var rabiViabGdd0Irr   = rabiGDD0_irr.gte(RABI_GDD0_TARGET).toByte().rename('rabi_viability_gdd0_irr');
+  var rabiViabGdd0Rain  = rabiGDD0_rain.gte(RABI_GDD0_TARGET).toByte().rename('rabi_viability_gdd0_rain');
+  var rabiViabGdd10Irr  = rabiGDD10_irr.gte(RABI_GDD10_TARGET).toByte().rename('rabi_viability_gdd10_irr');
+  var rabiViabGdd10Rain = rabiGDD10_rain.gte(RABI_GDD10_TARGET).toByte().rename('rabi_viability_gdd10_rain');
+
+  // Terminal codes — what ended the season.
+  // 0 = window-end fallback (no terminal fired AND GDD insufficient)
+  // 1 = GDD-met (no terminal fired AND GDD reached target)
+  // 2 = heat terminal | 3 = drought terminal | 4 = frost terminal
+  // Priority: any climate terminal that fired before the fallback wins.
+  var rabiTermFiredIrr = heatTermIrr.lt(rabiFallbackHarvIrr)
+                          .or(frostTermIrr.lt(rabiFallbackHarvIrr));
+  var rabiTermCodeIrr = ee.Image(0)
+    .where(rabiViabGdd0Irr.eq(1).and(rabiTermFiredIrr.not()), 1)
+    .where(heatTermIrr.lt(rabiFallbackHarvIrr).and(heatTermIrr.lte(frostTermIrr)), 2)
+    .where(frostTermIrr.lt(rabiFallbackHarvIrr).and(frostTermIrr.lt(heatTermIrr)), 4)
+    .toByte().rename('rabi_terminal_irr');
+
+  var rabiTermFiredRain = heatTermRain.lt(rabiFallbackHarvRain)
+                            .or(droughtTermRain.lt(rabiFallbackHarvRain))
+                            .or(frostTermRain.lt(rabiFallbackHarvRain));
+  var rabiMinTermRain = heatTermRain.min(droughtTermRain).min(frostTermRain);
+  var rabiTermCodeRain = ee.Image(0)
+    .where(rabiViabGdd0Rain.eq(1).and(rabiTermFiredRain.not()), 1)
+    .where(rabiMinTermRain.lt(rabiFallbackHarvRain).and(heatTermRain.eq(rabiMinTermRain)), 2)
+    .where(rabiMinTermRain.lt(rabiFallbackHarvRain).and(droughtTermRain.eq(rabiMinTermRain)), 3)
+    .where(rabiMinTermRain.lt(rabiFallbackHarvRain).and(frostTermRain.eq(rabiMinTermRain)), 4)
+    .toByte().rename('rabi_terminal_rain');
+
+  // Disruption — schedule deviation from climatological backward sow.
+  var rabiDisruptionIrr  = rabiSowIrr.subtract(backwardSowStatic).max(0)
+                            .round().toInt16().rename('rabi_disruption_irr');
+  var rabiDisruptionRain = rabiSowRain.subtract(backwardSowStatic).max(0)
+                            .round().toInt16().rename('rabi_disruption_rain');
+
+  // Maturity DOY — used to anchor kharif start.
+  var maturityFrac = ee.Image(RABI_GDD0_TARGET).divide(rabiGDD0_irr.max(1)).min(1);
+  var rabiMaturityDOY = rabiSowIrr.add(rabiSeasonLenIrr.multiply(maturityFrac).round())
+                          .min(rabiHarvestIrr);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // KHARIF ONSET — first composite where VSW crosses moisture threshold
+  // ─────────────────────────────────────────────────────────────────────
+  // Scan within plausible monsoon-onset window. Per-pixel detection.
+  var kharifOnsetReduce = allComposites
+    .filter(ee.Filter.gte('start_doy', P.KHARIF_ONSET_SEARCH_START))
+    .filter(ee.Filter.lte('start_doy', P.KHARIF_ONSET_SEARCH_END > 0
+              ? P.KHARIF_ONSET_SEARCH_END : 365))
+    .map(function(img) {
+      var doy = img.select('start_doy');
+      var vswWet = img.select('vsw_combined_mean').gte(KHARIF_ONSET_VSW_THRESH);
+      return doy.updateMask(vswWet).rename('kharif_onset');
+    }).reduce(ee.Reducer.min());
+  var kharifOnsetDOY = kharifOnsetReduce.select('kharif_onset_min')
+    .unmask(P.KHARIF_ONSET_SEARCH_END).round().toInt16().rename('kharif_onset_doy');
+
+  // ─────────────────────────────────────────────────────────────────────
+  // KHARIF SOWING — irrigated and rainfed tracks
+  // ─────────────────────────────────────────────────────────────────────
+  // Irrigated: rabi maturity + heat-close + turnaround. No moisture constraint.
+  // Rainfed: max of irr sow and monsoon onset (must wait for rain).
+  // Both maturityDOY and heatCloseStaticDOY are in wrapped-DOY space for NH;
+  // the resulting kharifSowIrr stays in wrapped space, and the wrapped composites
+  // (start_doy 366–726) cover the full kharif window for one calendar year.
+  // kharifOnsetDOY needs to be in the same space — add 365 if it came back in raw DOY.
+  var kharifOnsetWrapped = kharifOnsetDOY.add(P.HEAT_CLOSE_WRAP_ADD);
+  var kharifSowIrr = rabiMaturityDOY.max(heatCloseStaticDOY).add(TURNAROUND_DAYS)
+                       .round().rename('kharif_sow_irr');
+  var kharifSowRain = kharifSowIrr.max(kharifOnsetWrapped).round().rename('kharif_sow_rain');
+  // Per-pixel window end: 180-day kharif. Stays in same DOY space as sow.
+  var kharifWindowEndIrr  = kharifSowIrr.add(180);
+  var kharifWindowEndRain = kharifSowRain.add(180);
+
+  // ─────────────────────────────────────────────────────────────────────
+  // KHARIF HARVEST — terminal detection per track
+  // ─────────────────────────────────────────────────────────────────────
+  var kharifTermReduce = allComposites.map(function(img) {
+    var doy = img.select('start_doy');
+    var tmax = img.select('tmax_mean_c');
+    var vsw  = img.select('vsw_combined_mean');
+    var afterMinIrr  = doy.gt(kharifSowIrr.add(KHARIF_MIN_GROW_DAYS));
+    var afterMinRain = doy.gt(kharifSowRain.add(KHARIF_MIN_GROW_DAYS));
+    var withinIrr  = doy.lt(kharifWindowEndIrr);
+    var withinRain = doy.lt(kharifWindowEndRain);
+    var heatIrr  = doy.updateMask(afterMinIrr.and(withinIrr).and(tmax.gte(KHARIF_HEAT_TERM_C))).rename('heat_irr');
+    var heatRain = doy.updateMask(afterMinRain.and(withinRain).and(tmax.gte(KHARIF_HEAT_TERM_C))).rename('heat_rain');
+    var droughtRain = doy.updateMask(afterMinRain.and(withinRain).and(vsw.lt(VSW_TERMINAL_THRESH))).rename('drought_rain');
+    return heatIrr.addBands([heatRain, droughtRain]);
+  }).reduce(ee.Reducer.min());
+
+  var khFallbackHarvIrr  = kharifWindowEndIrr;
+  var khFallbackHarvRain = kharifWindowEndRain;
+  var khHeatTermIrr  = kharifTermReduce.select('heat_irr_min').unmask(99999);
+  var khHeatTermRain = kharifTermReduce.select('heat_rain_min').unmask(99999);
+  var khDroughtTermRain = kharifTermReduce.select('drought_rain_min').unmask(99999);
+
+  var kharifHarvestIrr  = khHeatTermIrr.min(khFallbackHarvIrr).round().rename('kharif_harvest_irr');
+  var kharifHarvestRain = khHeatTermRain.min(khDroughtTermRain).min(khFallbackHarvRain)
+                            .round().rename('kharif_harvest_rain');
+  var kharifSeasonLenIrr  = kharifHarvestIrr.subtract(kharifSowIrr).max(0)
+                              .rename('kharif_season_len_irr');
+  var kharifSeasonLenRain = kharifHarvestRain.subtract(kharifSowRain).max(0)
+                              .rename('kharif_season_len_rain');
+
+  // ─────────────────────────────────────────────────────────────────────
+  // KHARIF ACCUMULATION
+  // ─────────────────────────────────────────────────────────────────────
+  var kharifHeading = kharifSowIrr.add(kharifSeasonLenIrr.multiply(HEADING_FRAC).round());
+
+  var kharifPass = allComposites.map(function(img) {
+    var doy = img.select('start_doy');
+    var inIrr     = doy.gte(kharifSowIrr).and(doy.lt(kharifHarvestIrr));
+    var inRain    = doy.gte(kharifSowRain).and(doy.lt(kharifHarvestRain));
+    var inGfIrr   = doy.gte(kharifHeading).and(doy.lt(kharifHarvestIrr));
+    return ee.Image([
+      img.select('gdd0_sum').multiply(inIrr),
+      img.select('gdd10_sum').multiply(inIrr),
+      img.select('gdd0_sum').multiply(inRain),
+      img.select('gdd10_sum').multiply(inRain),
+      img.select('kharif_heat_days').multiply(inIrr),
+      img.select('kharif_heat_days').multiply(inRain),
+      img.select('drought_days').multiply(inRain),
+      img.select('irr_deficit_sum_mm').multiply(inIrr),
+      img.select('precip_sum_mm').multiply(inRain),
+      img.select('vsw_combined_mean').multiply(inRain),
+      inRain.toFloat(),
+      img.select('solar_mj_sum').multiply(inGfIrr),
+      img.select('tmean_c').multiply(inGfIrr),
+      inGfIrr.toFloat()
+    ]).unmask(0);
+  }).reduce(ee.Reducer.sum()).rename([
+    'gdd0_irr','gdd10_irr','gdd0_rain','gdd10_rain',
+    'heat_days_irr','heat_days_rain','drought_days_rain',
+    'irrigation_mm_irr','precip_kharif_mm','vsw_sum_rain','vsw_count_rain',
+    'ptq_solar','ptq_tmean','ptq_count'
+  ]);
+
+  var kharifGDD0_irr   = kharifPass.select('gdd0_irr').round().rename('kharif_gdd0_irr');
+  var kharifGDD0_rain  = kharifPass.select('gdd0_rain').round().rename('kharif_gdd0_rain');
+  var kharifGDD10_irr  = kharifPass.select('gdd10_irr').round().rename('kharif_gdd10_irr');
+  var kharifGDD10_rain = kharifPass.select('gdd10_rain').round().rename('kharif_gdd10_rain');
+
+  var khHeatDaysIrr  = kharifPass.select('heat_days_irr').toInt16().rename('kharif_heat_days_irr');
+  var khHeatDaysRain = kharifPass.select('heat_days_rain').toInt16().rename('kharif_heat_days_rain');
+  var khDroughtDaysRain = kharifPass.select('drought_days_rain').toInt16().rename('kharif_drought_days_rain');
+  var khIrrMm = kharifPass.select('irrigation_mm_irr').round().toInt16().rename('kharif_irrigation_mm_irr');
+  var khPrecipMm = kharifPass.select('precip_kharif_mm').round().toInt16().rename('precip_kharif_mm');
+  var khVswMeanRain = kharifPass.select('vsw_sum_rain')
+                        .divide(kharifPass.select('vsw_count_rain').max(1))
+                        .multiply(1000).round().toInt16().rename('vsw_mean_kharif_rain');
+
+  var khPtqFactor = kharifPass.select('ptq_solar')
+    .divide(kharifPass.select('ptq_tmean').max(0.1).multiply(8))
+    .divide(PTQ_OPTIMAL).clamp(PTQ_MIN_FACTOR, PTQ_MAX_FACTOR)
+    .unmask(PTQ_MIN_FACTOR).multiply(100).round().toByte();
+  var khPtqIrr  = khPtqFactor.rename('kharif_ptq_irr');
+  var khPtqRain = khPtqFactor.rename('kharif_ptq_rain');
+
+  var khViabGdd0Irr   = kharifGDD0_irr.gte(KHARIF_GDD0_TARGET).toByte().rename('kharif_viability_gdd0_irr');
+  var khViabGdd0Rain  = kharifGDD0_rain.gte(KHARIF_GDD0_TARGET).toByte().rename('kharif_viability_gdd0_rain');
+  var khViabGdd10Irr  = kharifGDD10_irr.gte(KHARIF_GDD10_TARGET).toByte().rename('kharif_viability_gdd10_irr');
+  var khViabGdd10Rain = kharifGDD10_rain.gte(KHARIF_GDD10_TARGET).toByte().rename('kharif_viability_gdd10_rain');
+
+  // Kharif terminal codes (no frost in core kharif zones).
+  var khTermFiredIrr = khHeatTermIrr.lt(khFallbackHarvIrr);
+  var khTermCodeIrr = ee.Image(0)
+    .where(khViabGdd10Irr.eq(1).and(khTermFiredIrr.not()), 1)
+    .where(khTermFiredIrr, 2)
+    .toByte().rename('kharif_terminal_irr');
+
+  var khMinTermRain = khHeatTermRain.min(khDroughtTermRain);
+  var khTermFiredRain = khMinTermRain.lt(khFallbackHarvRain);
+  var khTermCodeRain = ee.Image(0)
+    .where(khViabGdd10Rain.eq(1).and(khTermFiredRain.not()), 1)
+    .where(khTermFiredRain.and(khHeatTermRain.eq(khMinTermRain)), 2)
+    .where(khTermFiredRain.and(khDroughtTermRain.eq(khMinTermRain)), 3)
+    .toByte().rename('kharif_terminal_rain');
+
+  // Kharif disruption — schedule deviation from climatological onset.
+  // For irr: vs sow_irr's deterministic anchor (rabi maturity + heat_close + turnaround).
+  // For rain: vs irr sow (additional moisture-driven delay).
+  // Per-year both are 0 by construction for irr (no static reference).
+  // For rainfed: the difference between rain and irr sow IS the disruption.
+  var khDisruptionIrr  = ee.Image(0).toInt16().rename('kharif_disruption_irr');
+  var khDisruptionRain = kharifSowRain.subtract(kharifSowIrr).max(0)
+                          .round().toInt16().rename('kharif_disruption_rain');
+
+  // ─────────────────────────────────────────────────────────────────────
+  // CROSS-SEASON: intercrop gap
+  // ─────────────────────────────────────────────────────────────────────
+  // Both harvest and sow are in wrapped-DOY space (NH: 366–726; SH: raw).
+  // Direct subtraction gives gap in days between rabi harvest and kharif sow.
+  // For irr: bounded below by TURNAROUND_DAYS (kharifSowIrr is built from
+  //   max(maturity, heatClose) + TURNAROUND, so gap ≥ TURNAROUND when maturity
+  //   defines the floor). Larger values indicate heatClose forced a delay.
+  // For rain: additional moisture-driven delay added by waiting for monsoon onset.
+  var intercropGapIrr  = kharifSowIrr.subtract(rabiHarvestIrr).round()
+                           .toInt16().rename('intercrop_gap_irr');
+  var intercropGapRain = kharifSowRain.subtract(rabiHarvestRain).round()
+                           .toInt16().rename('intercrop_gap_rain');
+
+  // ─────────────────────────────────────────────────────────────────────
+  // ASSEMBLE 57-BAND OUTPUT
+  // ─────────────────────────────────────────────────────────────────────
+  return ee.Image([
+    // RABI rainfed (1-13)
+    rabiSowRain.toInt16(), rabiHarvestRain.toInt16(), rabiSeasonLenRain.toInt16(),
+    rabiGDD0_rain.toInt16(), rabiGDD10_rain.toInt16(),
+    rabiHeatDaysRain, rabiDroughtDaysRain, rabiFrostDaysRain, rabiPtqRain,
+    rabiViabGdd0Rain, rabiViabGdd10Rain, rabiTermCodeRain, rabiDisruptionRain,
+    // RABI irrigated (14-26)
+    rabiSowIrr.toInt16(), rabiHarvestIrr.toInt16(), rabiSeasonLenIrr.toInt16(),
+    rabiGDD0_irr.toInt16(), rabiGDD10_irr.toInt16(),
+    rabiHeatDaysIrr, rabiIrrMm, rabiFrostDaysIrr, rabiPtqIrr,
+    rabiViabGdd0Irr, rabiViabGdd10Irr, rabiTermCodeIrr, rabiDisruptionIrr,
+    // KHARIF rainfed (27-38)
+    kharifSowRain.toInt16(), kharifHarvestRain.toInt16(), kharifSeasonLenRain.toInt16(),
+    kharifGDD0_rain.toInt16(), kharifGDD10_rain.toInt16(),
+    khHeatDaysRain, khDroughtDaysRain, khPtqRain,
+    khViabGdd0Rain, khViabGdd10Rain, khTermCodeRain, khDisruptionRain,
+    // KHARIF irrigated (39-50)
+    kharifSowIrr.toInt16(), kharifHarvestIrr.toInt16(), kharifSeasonLenIrr.toInt16(),
+    kharifGDD0_irr.toInt16(), kharifGDD10_irr.toInt16(),
+    khHeatDaysIrr, khIrrMm, khPtqIrr,
+    khViabGdd0Irr, khViabGdd10Irr, khTermCodeIrr, khDisruptionIrr,
+    // Cross-season (51-52)
+    intercropGapIrr, intercropGapRain,
+    // Diagnostics (53-57)
+    rabiPrecipMm, khPrecipMm, rabiVswMeanRain, khVswMeanRain, kharifOnsetDOY
+  ]).updateMask(RABI_MASK).set('year', year);
+};
+
+// ======================================================
+// EXPORT YEARLY COLLECTION
+// ======================================================
+var collectionAssetId =
+  'projects/thermal-growing-seasons/assets/RabiKharifMetrics_1951_1980_' +
+  P.ASSET_SUFFIX + '_v20';
+var driveFolder = 'RabiKharifMetrics_v20_' + P.ASSET_SUFFIX;
+var descPrefix  = 'RabiKharifMetrics_v20_' + P.ASSET_SUFFIX + '_';
+
+for (var _y = startYear; _y <= endYear; _y++) {
+  var _yearStr = ('0000' + _y).slice(-4);
+  var _img = computeYearMetrics(ee.Number(_y));
+  if (EXPORT_TO_ASSET) {
+    Export.image.toAsset({
+      image: _img,
+      description: descPrefix + _yearStr,
+      assetId: collectionAssetId + '/' + _yearStr,
+      scale: 11132,
+      region: fullGeometry,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13,
+      pyramidingPolicy: {'.default': 'sample'}
+    });
+  }
+  if (EXPORT_TO_DRIVE) {
+    Export.image.toDrive({
+      image: _img,
+      description: 'Drive_v20_' + P.ASSET_SUFFIX + '_' + _yearStr,
+      folder: driveFolder,
+      fileNamePrefix: descPrefix + _yearStr,
+      scale: 11132,
+      region: fullGeometry,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13,
+      fileFormat: 'GeoTIFF'
+    });
+  }
+}
+
+print('✅ Rabi/Kharif Precompute v2.0 — ' + (endYear - startYear + 1) + ' years submitted.');
+print('Hemisphere: ' + HEMISPHERE);
+print('Asset: ' + collectionAssetId);
+print('Drive folder: ' + driveFolder);
+print('Output bands: 57 (full kharif/rabi × irr/rain × GDD0/GDD10 + viability + terminal + irrigation + diagnostics)');
+print('Static-only bands removed from annual output — load HeatDroughtStatic_' + HEMISPHERE +
+      '_v1, HybridGAEZAseasonalMask, vernalization_zones, ' + P.CROP_STATIC.split('/').pop() +
+      ' for: heat_open, heat_close, backward_sow, vern_zone, mean_min_soil_c, safeBegin, safeEnd, tropical_mask, annual_precip.');
+print('Boro rice mask deferred to GAEZ post-processing — annual output is generic GDD0+GDD10 climate signal.');

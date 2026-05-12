@@ -1,28 +1,49 @@
 // ======================================================
-// HEAT / DROUGHT STATIC LAYERS v1 — COMBINER
-// Combines 3 decadal batch images into final 11-band static.
+// HEAT / DROUGHT STATIC LAYERS v2 — COMBINER
+// Combines 3 decadal batch images into final static.
+// v2 adds GDD-based backward sow bands (p20 + p80, both GDD0 and GDD10).
+// Climatological GDD rate × per-year heat_close → p20/p80 spread.
 // Change HEMISPHERE at the top. Run once per hemisphere.
 // ======================================================
 
-var HEMISPHERE = 'SH';   // ←←← CHANGE TO 'NH' or 'SH'
+var HEMISPHERE = 'NH';   // ←←← CHANGE TO 'NH' or 'SH'
 
 var HEMI_PARAMS = {
   NH: {
     CLOSE_DOY_WRAP_ADD: 365,
     REGION: ee.Geometry.Polygon([[
       [-179.99, -10], [179.99, -10], [179.99, 75], [-179.99, 75]
-    ]], null, false)
+    ]], null, false),
+    // NH rabi window: Nov–Apr (months 11, 12, 1, 2, 3, 4) ≈ 181 days
+    RABI_MONTHS: [11, 12, 1, 2, 3, 4],
+    RABI_DAYS: 181
   },
   SH: {
     CLOSE_DOY_WRAP_ADD: 0,
     REGION: ee.Geometry.Polygon([[
       [-179.99, -55], [179.99, -55], [179.99, 0], [-179.99, 0]
-    ]], null, false)
+    ]], null, false),
+    // SH rabi window: May–Oct (months 5, 6, 7, 8, 9, 10) ≈ 184 days
+    RABI_MONTHS: [5, 6, 7, 8, 9, 10],
+    RABI_DAYS: 184
   }
 };
 var P = HEMI_PARAMS[HEMISPHERE];
 var EXPECTED_SEASON_DAYS = 150;
 
+// GDD targets — used to derive the calendar days needed to accumulate
+// a typical season's GDD at climatological rates.
+//   GDD0_TARGET  ≈ wheat full-season midpoint (1400–1800 GDD0 cultivar range)
+//   GDD10_TARGET ≈ medium-duration indica rice midpoint (1400–1600 GDD10)
+var GDD0_TARGET  = 1500;
+var GDD10_TARGET = 1500;
+
+var DAYS_IN_MONTH = {
+  1: 31,  2: 28.25, 3: 31,  4: 30,  5: 31,  6: 30,
+  7: 31,  8: 31,    9: 30, 10: 31, 11: 30, 12: 31
+};
+
+// ── Load batch outputs (from batch runner v1) ──────────────────────────────
 var batch1951 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1951_1960');
 var batch1961 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1961_1970');
 var batch1971 = ee.Image('projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_yearly_1971_1980');
@@ -33,7 +54,7 @@ print('Batch 1971-1980 bands:', batch1971.bandNames().length());
 
 var allYearsImage = batch1951.addBands(batch1961).addBands(batch1971);
 
-// ── Aggregations ───────────────────────────────────────────────────────────
+// ── Day-based aggregations (v1, retained) ──────────────────────────────────
 var heatOpenP20 = allYearsImage.select('heat_open_doy_.*')
   .reduce(ee.Reducer.percentile([20])).round().rename('heat_open_doy');
 
@@ -49,7 +70,13 @@ var hardHeatCloseMean = allYearsImage.select('hard_heat_close_doy_.*')
 var moistureCloseMean = allYearsImage.select('moisture_close_doy_.*')
   .reduce(ee.Reducer.mean()).round().rename('moisture_close_doy');
 
-// ── Fallback counts ────────────────────────────────────────────────────────
+// New: heat_close p20/p80 to drive GDD-based backward sow spread
+var heatCloseP20 = allYearsImage.select('heat_close_doy_.*')
+  .reduce(ee.Reducer.percentile([20])).round().rename('heat_close_doy_p20');
+var heatCloseP80 = allYearsImage.select('heat_close_doy_.*')
+  .reduce(ee.Reducer.percentile([80])).round().rename('heat_close_doy_p80');
+
+// ── Fallback counts (v1, retained) ─────────────────────────────────────────
 var heatOpenFB      = allYearsImage.select('heat_open_fallback_.*').reduce(ee.Reducer.sum()).rename('heat_open_fallback_yrs');
 var moistureOpenFB  = allYearsImage.select('moisture_open_fallback_.*').reduce(ee.Reducer.sum()).rename('moisture_open_fallback_yrs');
 var heatCloseFB     = allYearsImage.select('heat_close_fallback_.*').reduce(ee.Reducer.sum()).rename('heat_close_fallback_yrs');
@@ -62,22 +89,99 @@ var fallbackCounts = heatOpenFB
   .addBands(hardHeatCloseFB)
   .addBands(moistureCloseFB);
 
-// ── backward_sow_irr ───────────────────────────────────────────────────────
-// NH: heat_close is raw spring DOY (1-177); add 365 to wrap, subtract season.
-// SH: heat_close is raw austral-spring DOY (217-361); no wrap offset.
+// ── Day-based backward_sow_irr (v1, retained for compatibility) ────────────
 var backwardSowIrr = heatCloseMean
   .add(P.CLOSE_DOY_WRAP_ADD)
   .subtract(EXPECTED_SEASON_DAYS)
   .round()
   .rename('backward_sow_irr');
 
+// ──────────────────────────────────────────────────────────────────────────
+// NEW v2: GDD-based backward sow bands
+// ──────────────────────────────────────────────────────────────────────────
+// Approach: load ERA5-Land monthly climatology (1951–1980) for Tmean.
+// Compute per-month GDD0 and GDD10 contributions. Sum across the rabi window
+// months to get total climatological rabi GDD. Divide by rabi window length
+// in days to get mean GDD per day per pixel.
+//
+// daysRequired = GDD_TARGET / mean_GDD_per_day  (per pixel, climatological)
+// backward_sow_gdd_p20 = heat_close_p20 + WRAP − daysRequired
+// backward_sow_gdd_p80 = heat_close_p80 + WRAP − daysRequired
+//
+// daysRequired is constant per pixel (climatological), so the p20/p80 spread
+// in backward_sow comes from heat_close inter-annual variability propagated
+// through a stable GDD rate. This captures the dominant source of variance
+// while avoiding per-year daily integration. Adequate for subtropical and
+// tropical-monsoon zones where intra-rabi temperature is fairly stable.
+// ──────────────────────────────────────────────────────────────────────────
+
+var monthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')
+  .filterDate('1951-01-01', '1980-12-31')
+  .select('temperature_2m');
+
+// Per-month Tmean climatology (°C), one band per month
+var monthlyClim = ee.ImageCollection.fromImages(
+  ee.List.sequence(1, 12).map(function(m) {
+    m = ee.Number(m);
+    var monthData = monthly.filter(ee.Filter.calendarRange(m, m, 'month'));
+    return monthData.mean().subtract(273.15).rename('tmean_c').set('month', m);
+  })
+);
+
+var monthBands = [];
+for (var i = 1; i <= 12; i++) monthBands.push('tmean_c_' + i);
+var clim = monthlyClim.toBands().rename(monthBands);
+
+// Sum (max(0, Tmean) × days_in_month) and (max(0, Tmean−10) × days_in_month)
+// over the rabi-window months for this hemisphere.
+var gdd0Sum  = ee.Image.constant(0);
+var gdd10Sum = ee.Image.constant(0);
+P.RABI_MONTHS.forEach(function(m) {
+  var t = clim.select('tmean_c_' + m);
+  var d = DAYS_IN_MONTH[m];
+  gdd0Sum  = gdd0Sum.add(t.max(0).multiply(d));
+  gdd10Sum = gdd10Sum.add(t.subtract(10).max(0).multiply(d));
+});
+
+var meanGdd0Rate  = gdd0Sum.divide(P.RABI_DAYS).rename('mean_rabi_gdd0_rate');
+var meanGdd10Rate = gdd10Sum.divide(P.RABI_DAYS).rename('mean_rabi_gdd10_rate');
+
+// Days required to accumulate target GDD at climatological rate.
+// Use floors to keep arithmetic stable in cool zones where GDD10 rate ≈ 0.
+var daysReqGdd0  = ee.Image(GDD0_TARGET).divide(meanGdd0Rate.max(0.1)).round()
+                     .rename('days_req_gdd0');
+var daysReqGdd10 = ee.Image(GDD10_TARGET).divide(meanGdd10Rate.max(0.01)).round()
+                     .rename('days_req_gdd10');
+
+// Backward sow bands — p20 and p80 for both GDD bases.
+// daysRequired is constant across years, so percentile of (heat_close − daysRequired)
+// equals percentile(heat_close) − daysRequired.
+var backwardSowGdd0P20 = heatCloseP20.add(P.CLOSE_DOY_WRAP_ADD)
+  .subtract(daysReqGdd0).round().rename('backward_sow_gdd0_p20');
+var backwardSowGdd0P80 = heatCloseP80.add(P.CLOSE_DOY_WRAP_ADD)
+  .subtract(daysReqGdd0).round().rename('backward_sow_gdd0_p80');
+var backwardSowGdd10P20 = heatCloseP20.add(P.CLOSE_DOY_WRAP_ADD)
+  .subtract(daysReqGdd10).round().rename('backward_sow_gdd10_p20');
+var backwardSowGdd10P80 = heatCloseP80.add(P.CLOSE_DOY_WRAP_ADD)
+  .subtract(daysReqGdd10).round().rename('backward_sow_gdd10_p80');
+
 // ── Final image ────────────────────────────────────────────────────────────
 var staticLayers = heatOpenP20
   .addBands(moistureOpenP20)
   .addBands(heatCloseMean)
+  .addBands(heatCloseP20)
+  .addBands(heatCloseP80)
   .addBands(hardHeatCloseMean)
   .addBands(moistureCloseMean)
-  .addBands(backwardSowIrr)
+  .addBands(backwardSowIrr)             // v1 day-based (kept for compatibility)
+  .addBands(backwardSowGdd0P20)         // v2 GDD0-based (early-target sow)
+  .addBands(backwardSowGdd0P80)         // v2 GDD0-based (late-target sow)
+  .addBands(backwardSowGdd10P20)        // v2 GDD10-based (rice early-target)
+  .addBands(backwardSowGdd10P80)        // v2 GDD10-based (rice late-target)
+  .addBands(meanGdd0Rate)               // v2 diagnostic
+  .addBands(meanGdd10Rate)              // v2 diagnostic
+  .addBands(daysReqGdd0.toInt16())      // v2 diagnostic
+  .addBands(daysReqGdd10.toInt16())     // v2 diagnostic
   .addBands(fallbackCounts)
   .unmask(0)
   .clip(P.REGION);
@@ -85,8 +189,8 @@ var staticLayers = heatOpenP20
 // ── Export ─────────────────────────────────────────────────────────────────
 Export.image.toAsset({
   image: staticLayers,
-  description: 'HeatDroughtStatic_1951_1980_' + HEMISPHERE + '_v1',
-  assetId: 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v1',
+  description: 'HeatDroughtStatic_1951_1980_' + HEMISPHERE + '_v2',
+  assetId: 'projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v2',
   scale: 11132,
   region: P.REGION,
   crs: 'EPSG:4326',
@@ -94,5 +198,10 @@ Export.image.toAsset({
   pyramidingPolicy: {'.default': 'sample'}
 });
 
-print('✅ Combiner started for ' + HEMISPHERE);
-print('Asset: projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v1');
+print('✅ Combiner v2 started for ' + HEMISPHERE);
+print('Asset: projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v2');
+print('New bands: heat_close_doy_p20, heat_close_doy_p80, backward_sow_gdd0_p20, backward_sow_gdd0_p80,');
+print('           backward_sow_gdd10_p20, backward_sow_gdd10_p80, mean_rabi_gdd0_rate, mean_rabi_gdd10_rate,');
+print('           days_req_gdd0, days_req_gdd10');
+print('Rabi GDD window: months ' + P.RABI_MONTHS.join(',') + ' (' + P.RABI_DAYS + ' days)');
+print('GDD targets: GDD0=' + GDD0_TARGET + ', GDD10=' + GDD10_TARGET);
