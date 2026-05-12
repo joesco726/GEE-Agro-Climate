@@ -153,17 +153,26 @@ var daysReqGdd0  = ee.Image(GDD0_TARGET).divide(meanGdd0Rate.max(0.1)).round()
 var daysReqGdd10 = ee.Image(GDD10_TARGET).divide(meanGdd10Rate.max(0.01)).round()
                      .rename('days_req_gdd10');
 
+// Validity masks: backward_sow_gdd is only defined where the rabi window has
+// sufficient GDD budget to support the target season. Where gddSum < target the
+// zone cannot complete the crop (Zone 2 marginal, cool interior) and daysReq
+// would be spuriously large, producing garbage DOY values. After the final
+// .unmask(0) below, invalid pixels are set to 0 — an unambiguous sentinel since
+// no real wrapped sow DOY is 0.
+var gdd0Valid  = gdd0Sum.gte(GDD0_TARGET);
+var gdd10Valid = gdd10Sum.gte(GDD10_TARGET);
+
 // Backward sow bands — p20 and p80 for both GDD bases.
 // daysRequired is constant across years, so percentile of (heat_close − daysRequired)
 // equals percentile(heat_close) − daysRequired.
 var backwardSowGdd0P20 = heatCloseP20.add(P.CLOSE_DOY_WRAP_ADD)
-  .subtract(daysReqGdd0).round().rename('backward_sow_gdd0_p20');
+  .subtract(daysReqGdd0).round().updateMask(gdd0Valid).rename('backward_sow_gdd0_p20');
 var backwardSowGdd0P80 = heatCloseP80.add(P.CLOSE_DOY_WRAP_ADD)
-  .subtract(daysReqGdd0).round().rename('backward_sow_gdd0_p80');
+  .subtract(daysReqGdd0).round().updateMask(gdd0Valid).rename('backward_sow_gdd0_p80');
 var backwardSowGdd10P20 = heatCloseP20.add(P.CLOSE_DOY_WRAP_ADD)
-  .subtract(daysReqGdd10).round().rename('backward_sow_gdd10_p20');
+  .subtract(daysReqGdd10).round().updateMask(gdd10Valid).rename('backward_sow_gdd10_p20');
 var backwardSowGdd10P80 = heatCloseP80.add(P.CLOSE_DOY_WRAP_ADD)
-  .subtract(daysReqGdd10).round().rename('backward_sow_gdd10_p80');
+  .subtract(daysReqGdd10).round().updateMask(gdd10Valid).rename('backward_sow_gdd10_p80');
 
 // ── Final image ────────────────────────────────────────────────────────────
 var staticLayers = heatOpenP20
@@ -178,10 +187,12 @@ var staticLayers = heatOpenP20
   .addBands(backwardSowGdd0P80)         // v2 GDD0-based (late-target sow)
   .addBands(backwardSowGdd10P20)        // v2 GDD10-based (rice early-target)
   .addBands(backwardSowGdd10P80)        // v2 GDD10-based (rice late-target)
-  .addBands(meanGdd0Rate)               // v2 diagnostic
-  .addBands(meanGdd10Rate)              // v2 diagnostic
-  .addBands(daysReqGdd0.toInt16())      // v2 diagnostic
-  .addBands(daysReqGdd10.toInt16())     // v2 diagnostic
+  .addBands(meanGdd0Rate)                                          // v2 diagnostic
+  .addBands(meanGdd10Rate)                                         // v2 diagnostic
+  .addBands(daysReqGdd0.toInt16())                                 // v2 diagnostic
+  .addBands(daysReqGdd10.toInt16())                                // v2 diagnostic
+  .addBands(gdd0Sum.round().toInt16().rename('rabi_gdd0_budget'))  // v2 diagnostic: total seasonal GDD0 capacity
+  .addBands(gdd10Sum.round().toInt16().rename('rabi_gdd10_budget'))// v2 diagnostic: total seasonal GDD10 capacity
   .addBands(fallbackCounts)
   .unmask(0)
   .clip(P.REGION);
@@ -200,8 +211,13 @@ Export.image.toAsset({
 
 print('✅ Combiner v2 started for ' + HEMISPHERE);
 print('Asset: projects/thermal-growing-seasons/assets/HeatDroughtStatic_' + HEMISPHERE + '_v2');
-print('New bands: heat_close_doy_p20, heat_close_doy_p80, backward_sow_gdd0_p20, backward_sow_gdd0_p80,');
-print('           backward_sow_gdd10_p20, backward_sow_gdd10_p80, mean_rabi_gdd0_rate, mean_rabi_gdd10_rate,');
-print('           days_req_gdd0, days_req_gdd10');
+print('New bands: heat_close_doy_p20, heat_close_doy_p80,');
+print('           backward_sow_gdd0_p20, backward_sow_gdd0_p80 (masked where rabi_gdd0_budget < GDD0_TARGET),');
+print('           backward_sow_gdd10_p20, backward_sow_gdd10_p80 (masked where rabi_gdd10_budget < GDD10_TARGET),');
+print('           mean_rabi_gdd0_rate, mean_rabi_gdd10_rate,');
+print('           days_req_gdd0, days_req_gdd10,');
+print('           rabi_gdd0_budget, rabi_gdd10_budget');
+print('Validity: backward_sow_gdd0=0 means gdd0_budget < ' + GDD0_TARGET + ' (zone cannot support target GDD0 crop)');
+print('          backward_sow_gdd10=0 means gdd10_budget < ' + GDD10_TARGET + ' (zone too cool for target GDD10 crop)');
 print('Rabi GDD window: months ' + P.RABI_MONTHS.join(',') + ' (' + P.RABI_DAYS + ' days)');
 print('GDD targets: GDD0=' + GDD0_TARGET + ', GDD10=' + GDD10_TARGET);
