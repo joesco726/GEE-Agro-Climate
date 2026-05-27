@@ -1,0 +1,524 @@
+// ======================================================
+// v115 — Winter/spring crops only; Mediterranean zones properly included;
+//         dual drought signal (SPEI [1–4] Mediterranean, [5–8] continental);
+//         rabi logic removed (separate script); dead code pruned.
+// ======================================================
+var hemisphere = 'North';
+var startYear = 1951;
+var endYear = 1980;
+var useRecommended = false;
+var springGDDThresh = useRecommended ? 1500 : 1650;
+var winterGDDThresh = useRecommended ? 1800 : 2250;
+// === TUNABLE PARAMETERS ===
+var reproStressDaysRequired = 9;
+var heatThreshC = 31;
+var dryVswThresh = 0.20;
+var waterlogVswThresh = 0.48;
+var waterlogStressDaysRequired = 5;
+var viableVswThresh = 0.19;
+var viableAutumnVswThresh = 0.22;
+var turnaroundDays = 40;
+// (secondCropGDDMultiplier removed — rabi/second-crop logic moved to separate script)
+var heatMitigationIrr = 0.65;
+var droughtMitigationIrr = 0.05;
+var jointingGDDThreshold = 500;
+var hardyJointingGDDThreshold = 450;
+var headingGDDThreshold = 900;          // cumulative from green-up: jointing + ~400 GDD flag-leaf→anthesis
+var hardyHeadingGDDThreshold = 750;     // hardy varieties reach heading with less accumulated heat
+var grainFillEndGDDThreshold = 1300;    // heading + ~400 GDD through watery-ripe to dough stage
+var hardyGrainFillEndGDDThreshold = 1100;
+// --- Reproductive frost yield-multiplier parameters ---
+// Thresholds at -2°C (standard) and -4°C (hardy); heading-weighted frost-hours normalised to these.
+// criticalReproFrostIndex tuned so ~10 weighted frost-hours at anthesis ≈ total reproductive failure.
+// Early-modern note: no compensatory tillering management, so partial kills converted to full loss faster.
+var criticalReproFrostIndex = 10;
+var hardyCriticalReproFrostIndex = 15;
+// --- Winter crown kill parameters ---
+// LT50 model calibrated to early-modern landrace cold hardiness (Stanca et al. 1996, Fowler 2008).
+// Modern bred varieties are ~4-6°C hardier; use less conservative thresholds here.
+// Thresholds apply to ERA5-Land soil_temperature_level_1 (0-7 cm layer average), which runs
+// ~3-5°C warmer than actual 2-3 cm crown temperature during cold events due to layer averaging.
+// Thresholds are set accordingly lower than raw LT50 crown values to compensate.
+var crownKillSafeThreshC = -8;    // soil level 1: ≈ -11 to -13°C actual crown → damage onset
+var crownKillTotalThreshC = -22;  // soil level 1: ≈ -25 to -27°C actual crown → complete stand loss
+var hardyCrownKillSafeThreshC = -14;   // rye-type hardy varieties
+var hardyCrownKillTotalThreshC = -30;
+// --- Catastrophe flag threshold ---
+var catastropheThreshold = 0.15;  // yield factor below this is flagged as catastrophe
+
+// === NEW: PTQ PARAMETERS ===
+var ptqOptimal = 1.2;      // MJ m⁻² °C⁻¹ day⁻¹ — calibrated to ERA5 solar; East Anglia June ≈ 1.25 → ~1.0× factor
+var ptqMinFactor = 0.6;
+var ptqMaxFactor = 1.4;
+
+var staticAssetNorth = 'projects/thermal-growing-seasons/assets/StaticCropLayerNH_v2';
+var statics = ee.Image(staticAssetNorth);
+var meanMinSoilC = statics.select('b1').rename('mean_min_soil_c');
+var farmerThermalBegin = statics.select('b3').rename('farmer_begin_doy');
+var safeThermalEnd = statics.select('b4').rename('safe_end_doy');
+var autumnStartDOY = statics.select('b5').rename('autumn_start_DOY');
+var autumnEndDOY = statics.select('b6').rename('autumn_end_DOY');
+// === STATIC MASKS ===
+var growingSeasonLength = safeThermalEnd.subtract(farmerThermalBegin);
+growingSeasonLength = growingSeasonLength.where(growingSeasonLength.lt(0), growingSeasonLength.add(365));
+// hasColdWinter: soil freezes, true dormancy, winter hardiness and crown-kill risk apply.
+var hasColdWinter = meanMinSoilC.lte(0);
+// hasMildWinterSowable: 0–8°C winters — cold enough for vernalization but no hard dormancy.
+//   Covers Mediterranean, maritime SW Europe, Levant coasts. Boundary at 8°C excludes
+//   Punjab/subtropical rabi zones (mean_min_soil_c typically >10°C) → separate rabi script.
+var hasMildWinterSowable = meanMinSoilC.gt(0).lte(8);
+// hasWinterCrop: winter sowing is the primary strategy (replaces hasRealWinter throughout).
+var hasWinterCrop = hasColdWinter.or(hasMildWinterSowable);
+// isMediterraneanZone: mild winters AND the statics encode a near-year-round thermal season,
+//   meaning drought (not cold) ends the crop window. Needs a safeThermalEnd cap to DOY ~175.
+//   growingSeasonLength >= 330 distinguishes Mediterranean from maritime UK (season ~220–270).
+var isMediterraneanZone = hasMildWinterSowable.and(growingSeasonLength.gte(330));
+// === LATITUDE & MASKS ===
+var lat = ee.Image.pixelLonLat().select('latitude').rename('latitude');
+var fullGeometry = ee.Geometry.Polygon([[[-180, 0], [180, 0], [180, 90], [-180, 90]]], null, false);
+var pureClimaticMask = ee.Image('projects/thermal-growing-seasons/assets/ThermalGSL_5C_01deg').select(0).unmask(0);
+var oceanMask = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR').first().select('soil_temperature_level_1').mask().not();
+var computeMask = pureClimaticMask.and(oceanMask.not());
+// === PARTON-LOGAN FROST HOURS (FIXED – now correctly handles Image doy) ===
+var calculatePartonLoganFrostHours = function(tminC, tmaxC, doy, lat, Tc) {
+  Tc = ee.Image.constant(Tc);
+  var doyImg = ee.Image(doy);                    // ← handles scalar OR Image band
+  var phi = lat.multiply(Math.PI).divide(180);
+  var delta = ee.Image.constant(23.45).multiply(Math.PI).divide(180)
+    .multiply(doyImg.subtract(81).multiply(2 * Math.PI / 365).sin());
+  var ws = phi.tan().multiply(delta.tan()).multiply(-1).acos();
+  var DL = ws.multiply(24).divide(Math.PI);
+  var arg = (Tc.subtract(tminC)).divide(tmaxC.subtract(tminC));
+  var chDay = DL.divide(2).multiply(ee.Image.constant(1).subtract(arg.multiply(2).subtract(1).pow(2)).sqrt());
+  var ts = tminC.add(tmaxC.subtract(tminC).multiply(4).divide(DL.add(4)).multiply(Math.PI).sin());
+  var nightLength = ee.Image.constant(24).subtract(DL);
+  var nightExponent = (Tc.subtract(ts)).divide(ts.subtract(tminC))
+    .multiply(nightLength.log());
+  var chNight = nightLength.subtract(nightExponent.exp());
+  return chDay.add(chNight).max(0).min(24);
+};
+// === 8-DAY COMPOSITES ===
+var make8DayComposites = function(year) {
+  year = ee.Number(year);
+  var col = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .select(['soil_temperature_level_1', 'temperature_2m_min', 'snow_cover', 'temperature_2m',
+             'volumetric_soil_water_layer_1', 'volumetric_soil_water_layer_2',
+             'total_precipitation_sum', 'surface_solar_radiation_downwards_sum']);
+  var doyList = ee.List.sequence(1, 361, 8);
+  return doyList.map(function(startDoy) {
+    startDoy = ee.Number(startDoy);
+    var endDoy = startDoy.add(7);
+    var periodCol = col.filter(ee.Filter.calendarRange(startDoy, endDoy, 'day_of_year'));
+    var periodStats = periodCol.map(function(img) {
+      var soilC = img.select('soil_temperature_level_1').subtract(273.15);
+      var tminC = img.select('temperature_2m_min').subtract(273.15);
+      var tmeanC = img.select('temperature_2m').subtract(273.15);
+      var snow = img.select('snow_cover');
+      var vsw1 = img.select('volumetric_soil_water_layer_1');
+      var vsw2 = img.select('volumetric_soil_water_layer_2');
+      var rootVSW = vsw1.add(vsw2).divide(2);
+      var autumnVSW = vsw1.multiply(0.7).add(vsw2.multiply(0.3));
+      var precipMm = img.select('total_precipitation_sum').multiply(1000).rename('precip_sum_mm');
+      var solarMj = img.select('surface_solar_radiation_downwards_sum').divide(1e6).rename('solar_mj');
+      var viable = soilC.gt(5).and(tminC.gt(0)).and(snow.eq(0)).and(rootVSW.gt(viableVswThresh)).rename('viable');
+      var viableAutumn = viable.and(autumnVSW.gt(viableAutumnVswThresh)).rename('viable_autumn');
+      var gdd = tmeanC.max(0).rename('gdd');
+      var thermalViable = soilC.gt(5).and(tminC.gt(0)).and(snow.eq(0)).rename('thermal_viable');
+      var thermalGdd = tmeanC.max(0).multiply(thermalViable).rename('thermal_gdd');
+      var heatCond = tmeanC.gte(heatThreshC);
+      var dryCond = rootVSW.lte(dryVswThresh);
+      var waterlogCond = rootVSW.gte(waterlogVswThresh).rename('waterlog_cond');
+      var stressDay = heatCond.or(dryCond).or(waterlogCond).rename('stress_day');
+      return img.addBands([viable, viableAutumn, gdd, thermalGdd, stressDay, precipMm, waterlogCond, solarMj]);
+    });
+    var gddSum = periodStats.select('gdd').sum().rename('gdd_sum');
+    var thermalGddSum = periodStats.select('thermal_gdd').sum().rename('thermal_gdd_sum');
+    var viableDays = periodStats.select('viable').sum().rename('viable_days');
+    var viableAutumnDays = periodStats.select('viable_autumn').sum().rename('viable_autumn_days');
+    var precipSum = periodStats.select('precip_sum_mm').sum().rename('precip_sum_mm');
+    var solarSum = periodStats.select('solar_mj').sum().rename('solar_mj_sum');
+    var waterlogDays = periodStats.select('waterlog_cond').sum().rename('waterlog_days');
+    var stressDays = periodStats.select('stress_day').sum().rename('stress_days');
+    var composite = periodCol.mean()
+      .addBands([gddSum, thermalGddSum, viableDays, viableAutumnDays, stressDays, precipSum, solarSum, waterlogDays])
+      .addBands(ee.Image.constant(startDoy).toFloat().rename('start_doy'))
+      .set('start_doy', startDoy);
+    return composite;
+  });
+};
+// === PER-YEAR METRICS ===
+var computeYearMetrics = function(year) {
+  year = ee.Number(year);
+  var dailyLike = ee.ImageCollection(make8DayComposites(year)).sort('start_doy');
+  // === SPRING CANDIDATES & RABI SECOND-CROP LOGIC ===
+  var strictSpring = dailyLike.map(function(img) {
+    var afterFarmerBegin = img.select('start_doy').gte(farmerThermalBegin);
+    var viableWindow = img.select('viable_days').gte(4);
+    return img.select('start_doy').updateMask(afterFarmerBegin.and(viableWindow));
+  }).reduce(ee.Reducer.min());
+  var lenientSpring = dailyLike.map(function(img) {
+    var afterFarmerBegin = img.select('start_doy').gte(farmerThermalBegin);
+    var viableWindow = img.select('viable_days').gte(1);
+    return img.select('start_doy').updateMask(afterFarmerBegin.and(viableWindow));
+  }).reduce(ee.Reducer.min());
+  var springStartPerYear = strictSpring.where(strictSpring.eq(0), lenientSpring).rename('spring_start_candidate');
+  var springPhaseStart = springStartPerYear
+    .where(springStartPerYear.eq(0).or(springStartPerYear.gt(safeThermalEnd)), farmerThermalBegin)
+    .round();
+  // === ROBUST GDD START DATE ===
+  var gddStartDoy = springPhaseStart;
+  // === DROUGHT — dual SPEI signal ===
+  // Continental/cold-winter zones: reproductive drought is in the summer grain-fill window.
+  // Mediterranean/mild-winter zones: critical drought is winter–spring rainfall deficit;
+  //   summer drought is irrelevant (crop already harvested by late June).
+  var speiCol = ee.ImageCollection('CSIC/SPEI/2_10')
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .select('SPEI_01_month');
+  var makeMinSPEI = function(months) {
+    var col = speiCol.filter(ee.Filter.inList('month', months));
+    return ee.Image(ee.Algorithms.If(
+      col.size().gt(0),
+      col.min().rename('SPEI_01_month'),
+      ee.Image.constant(0).rename('SPEI_01_month')
+    )).unmask(0);
+  };
+  var continentalDrought = makeMinSPEI(hemisphere === 'North' ? [5,6,7,8] : [11,12,1,2]).lte(-1.5);
+  var mediterraneanDrought = makeMinSPEI([1,2,3,4]).lte(-1.5);
+  var droughtOutcome = continentalDrought
+    .where(isMediterraneanZone, mediterraneanDrought)
+    .toByte().rename('drought');
+  // effectiveEndDOY: cuts season short in drought years; Mediterranean zones also capped
+  // at DOY 175 (winter wheat must complete before summer drought/heat regardless of SPEI).
+  var effectiveEndDOY = safeThermalEnd.where(droughtOutcome.eq(1), farmerThermalBegin.subtract(1));
+  // cropSafeThermalEnd: local season ceiling used everywhere inside this function.
+  //   Mediterranean override prevents accumulating summer GDD (statics thermal end is year-round
+  //   for these zones since mild winters never trigger a hard thermal cutoff).
+  var cropSafeThermalEnd = safeThermalEnd.where(isMediterraneanZone, ee.Image.constant(175));
+  effectiveEndDOY = effectiveEndDOY.min(cropSafeThermalEnd);
+  // === DAILY ERA5 for GDD, jointing, and optimized frost ===
+  var dailyCol = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .select(['temperature_2m', 'temperature_2m_min', 'temperature_2m_max']);
+  var dailyProcessed = dailyCol.map(function(img) {
+    // Float32-cast derived bands only; original ERA5 Float64 bands excluded for type safety.
+    var tmeanC = img.select('temperature_2m').subtract(273.15).toFloat();
+    var tminC  = img.select('temperature_2m_min').subtract(273.15).toFloat();
+    var tmaxC  = img.select('temperature_2m_max').subtract(273.15).toFloat();
+    var doyNum = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1).float();
+    var gdd    = tmeanC.max(0).rename('gdd_daily');
+    return tmeanC.rename('tmeanC')
+      .addBands([gdd, tminC.rename('tminC'), tmaxC.rename('tmaxC'),
+                 ee.Image(doyNum).toFloat().rename('doy')])
+      .set('doy', doyNum);
+  });
+  // === EFFECTIVE GDD — parallelized sums, no iterate needed ===
+  // Uses effectiveEndDOY (drought-adjusted + Mediterranean cap) as the season ceiling.
+  var effectiveGDD = dailyProcessed.map(function(img) {
+    var inPhase = img.select('doy').gte(gddStartDoy).and(img.select('doy').lte(effectiveEndDOY));
+    return img.select('gdd_daily').multiply(inPhase).rename('gdd_daily');
+  }).sum().rename('effective_gdd');
+  var thermalEffectiveGDD = dailyProcessed.map(function(img) {
+    var doyImg = img.select('doy');
+    var inPhase = doyImg.gte(gddStartDoy).and(doyImg.lte(effectiveEndDOY));
+    var gddBase = img.select('gdd_daily');
+    var thermalGdd = gddBase.where(img.select('tmeanC').gte(heatThreshC), gddBase.multiply(heatMitigationIrr));
+    return thermalGdd.multiply(inPhase).rename('thermal_gdd');
+  }).sum().rename('thermal_effective_gdd');
+  // === PHENOLOGICAL CUMULATIVE — 46-step 8-day iterate using thermal_gdd_sum ===
+  // thermal_gdd_sum gates by soil > 5°C, tmin > 0°C, no snow — correct for phenological staging.
+  // 46 steps vs 365 cuts iterate cost ~8×; ±8-day precision is sufficient for historical modeling.
+  var phenoGddList = dailyLike.select(['thermal_gdd_sum', 'start_doy'])
+    .sort('start_doy').toList(dailyLike.size());
+  var phenoInitial = ee.List([ee.Image.constant(0).toFloat().rename('cum_thermal_gdd')]);
+  var phenoCumList = phenoGddList.iterate(function(current, prevList) {
+    current = ee.Image(current);
+    var listSoFar = ee.List(prevList);
+    var lastCum = ee.Image(listSoFar.get(-1));
+    var doy = current.select('start_doy');
+    var inPhase = doy.gte(gddStartDoy).and(doy.lte(cropSafeThermalEnd));
+    var newCum = lastCum.select('cum_thermal_gdd')
+      .add(current.select('thermal_gdd_sum').toFloat().multiply(inPhase))
+      .rename('cum_thermal_gdd');
+    return listSoFar.add(current.addBands(newCum));
+  }, phenoInitial);
+  var phenoCumCollection = ee.ImageCollection(ee.List(phenoCumList).slice(1));
+  // === SPRING HARVEST TIMING (8-day precision from phenological cumulative) ===
+  var springHarvestDOY = phenoCumCollection.map(function(img) {
+    return img.select('start_doy').updateMask(img.select('cum_thermal_gdd').gte(springGDDThresh));
+  }).reduce(ee.Reducer.min()).unmask(cropSafeThermalEnd.add(1));
+  var baseMinSowingDOY = springHarvestDOY.add(turnaroundDays);
+  var winterOvergrowthOffset = meanMinSoilC.lte(0)
+    .multiply(40)
+    .add(meanMinSoilC.gt(0).multiply(meanMinSoilC.multiply(2.991).add(40)));
+  var winterCapDOY = safeThermalEnd.subtract(winterOvergrowthOffset)
+    .updateMask(meanMinSoilC.lt(5).and(hasWinterCrop));
+  var minSowingDOY = baseMinSowingDOY.max(winterCapDOY)
+    .where(baseMinSowingDOY.max(winterCapDOY).gt(safeThermalEnd), safeThermalEnd.add(1))
+    .rename('min_sowing_doy');
+  // === TWO-STAGE DYNAMIC WINTER SOWING ===
+  var strictAutumn4 = dailyLike.map(function(img) {
+    var inAutumnWindow = img.select('start_doy').gte(autumnStartDOY).and(img.select('start_doy').lte(autumnEndDOY));
+    var viableWindow = img.select('viable_autumn_days').gte(4);
+    return img.select('start_doy').updateMask(inAutumnWindow.and(viableWindow));
+  }).reduce(ee.Reducer.min()).unmask(0);
+  var lenientAutumn4 = dailyLike.map(function(img) {
+    var inAutumnWindow = img.select('start_doy').gte(autumnStartDOY).and(img.select('start_doy').lte(autumnEndDOY));
+    var viableWindow = img.select('viable_autumn_days').gte(1);
+    return img.select('start_doy').updateMask(inAutumnWindow.and(viableWindow));
+  }).reduce(ee.Reducer.min()).unmask(0);
+  var autumnStart4 = strictAutumn4.where(strictAutumn4.eq(0), lenientAutumn4);
+  var autumnStartPerYear = autumnStart4.rename('autumn_start_candidate');
+  var winterSowingDOY = autumnStartPerYear.max(minSowingDOY).rename('winter_sowing_doy');
+  var sowingAfterSafeEnd = winterSowingDOY.gt(autumnEndDOY);
+  var invalidWinterSowing = hasWinterCrop.and(sowingAfterSafeEnd).rename('invalid_winter_sowing');
+  // === GDD-BASED PHENOLOGICAL STAGES (single merged pass over phenoCumCollection) ===
+  var phenoDOYs = phenoCumCollection.map(function(img) {
+    var doyImg = img.select('start_doy');
+    var cum = img.select('cum_thermal_gdd');
+    return doyImg.updateMask(cum.gte(jointingGDDThreshold)).rename('jointing_doy')
+      .addBands(doyImg.updateMask(cum.gte(hardyJointingGDDThreshold)).rename('hardy_jointing_doy'))
+      .addBands(doyImg.updateMask(cum.gte(headingGDDThreshold)).rename('heading_doy'))
+      .addBands(doyImg.updateMask(cum.gte(hardyHeadingGDDThreshold)).rename('hardy_heading_doy'))
+      .addBands(doyImg.updateMask(cum.gte(grainFillEndGDDThreshold)).rename('grain_fill_end_doy'))
+      .addBands(doyImg.updateMask(cum.gte(hardyGrainFillEndGDDThreshold)).rename('hardy_grain_fill_end_doy'));
+  }).reduce(ee.Reducer.min());
+  // reduce() on a multi-band collection appends '_min' to each band name
+  var jointingDOY = phenoDOYs.select('jointing_doy_min').unmask(cropSafeThermalEnd.add(1)).rename('jointing_doy');
+  var hardyJointingDOY = phenoDOYs.select('hardy_jointing_doy_min').unmask(cropSafeThermalEnd.add(1)).rename('hardy_jointing_doy');
+  var headingDOY = phenoDOYs.select('heading_doy_min').unmask(cropSafeThermalEnd.add(1)).rename('heading_doy');
+  var hardyHeadingDOY = phenoDOYs.select('hardy_heading_doy_min').unmask(cropSafeThermalEnd.add(1)).rename('hardy_heading_doy');
+  var grainFillEndDOY = phenoDOYs.select('grain_fill_end_doy_min').unmask(cropSafeThermalEnd.add(1)).rename('grain_fill_end_doy');
+  var hardyGrainFillEndDOY = phenoDOYs.select('hardy_grain_fill_end_doy_min').unmask(cropSafeThermalEnd.add(1)).rename('hardy_grain_fill_end_doy');
+  // === REPRODUCTIVE FROST YIELD FACTOR ===
+  // Single pass over dailyProcessed computes both standard and hardy frost scores plus the
+  // window tmin needed for the needsFrostCalc guard. Triangular phenological weight peaks at
+  // headingDOY (anthesis) — Fuller et al. 2007, Frederiks et al. 2012. Early-modern landraces
+  // lacked compensatory tillering management, amplifying yield loss from partial damage.
+  var frostMapped = dailyProcessed.map(function(img) {
+    var doyImg = img.select('doy');
+    var tminC = img.select('tminC');
+    var tmaxC = img.select('tmaxC');
+    var inWindow = doyImg.gte(jointingDOY).and(doyImg.lte(grainFillEndDOY));
+    var preSpan = headingDOY.subtract(jointingDOY).max(1);
+    var postSpan = grainFillEndDOY.subtract(headingDOY).max(1);
+    var phenoWeight = doyImg.subtract(jointingDOY).divide(preSpan).clamp(0, 1)
+      .min(grainFillEndDOY.subtract(doyImg).divide(postSpan).clamp(0, 1));
+    var inWindowH = doyImg.gte(hardyJointingDOY).and(doyImg.lte(hardyGrainFillEndDOY));
+    var preSpanH = hardyHeadingDOY.subtract(hardyJointingDOY).max(1);
+    var postSpanH = hardyGrainFillEndDOY.subtract(hardyHeadingDOY).max(1);
+    var phenoWeightH = doyImg.subtract(hardyJointingDOY).divide(preSpanH).clamp(0, 1)
+      .min(hardyGrainFillEndDOY.subtract(doyImg).divide(postSpanH).clamp(0, 1));
+    var frostH  = calculatePartonLoganFrostHours(tminC, tmaxC, doyImg, lat, -2);
+    var frostHH = calculatePartonLoganFrostHours(tminC, tmaxC, doyImg, lat, -4);
+    return frostH.multiply(phenoWeight).updateMask(inWindow).rename('frost_score')
+      .addBands(frostHH.multiply(phenoWeightH).updateMask(inWindowH).rename('frost_score_hardy'))
+      .addBands(tminC.updateMask(inWindow).rename('tmin_in_window'));
+  });
+  var reproMinTmin = frostMapped.select('tmin_in_window').min().rename('repro_min_tmin');
+  var needsFrostCalc = reproMinTmin.lte(0);
+  var frostSums = frostMapped.select(['frost_score', 'frost_score_hardy']).map(function(img) {
+    return img.updateMask(needsFrostCalc);
+  }).sum().unmask(0);
+  var reproFrostIndex = frostSums.select('frost_score').rename('repro_frost_index');
+  var hardyReproFrostIndex = frostSums.select('frost_score_hardy').rename('hardy_repro_frost_index');
+  // Yield multipliers: 1.0 = no loss, 0.0 = total reproductive failure.
+  var reproFrostFactor = ee.Image.constant(1).subtract(
+    reproFrostIndex.divide(criticalReproFrostIndex).clamp(0, 1)
+  ).rename('repro_frost_factor');
+  var hardyReproFrostFactor = ee.Image.constant(1).subtract(
+    hardyReproFrostIndex.divide(hardyCriticalReproFrostIndex).clamp(0, 1)
+  ).rename('hardy_repro_frost_factor');
+  // === WINTER CROWN KILL FACTOR ===
+  // Minimum ERA5-Land soil_temperature_level_1 (0-7 cm) during dormancy (DOY 1 to gddStartDoy).
+  // For year Y this covers the end-of-dormancy cold experienced by the crop sown in autumn Y-1.
+  // Fetched in a separate collection to avoid Float64 type-promotion in dailyProcessed, which
+  // would make the doy band heterogeneous across the iterated GDD accumulation collections.
+  var crownTempC = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .filter(ee.Filter.calendarRange(1, 120, 'day_of_year'))
+    .select(['soil_temperature_level_1'])
+    .map(function(img) {
+      var soil1C = img.select('soil_temperature_level_1').subtract(273.15);
+      var doy = ee.Date(img.get('system:time_start')).getRelative('day', 'year').add(1);
+      return soil1C.rename('soil1C').updateMask(ee.Image.constant(doy).lte(gddStartDoy));
+    }).min().unmask(0);
+  // Linear damage: 1.0 (no damage) at safe threshold, 0.0 (total kill) at total-kill threshold.
+  // Only applied where hasWinterCrop; non-wheat pixels are not at crown-kill risk.
+  // Mediterranean (hasMildWinterSowable) included: soils rarely reach -8°C so factor ≈ 1.0
+  // in most years, but extreme events (e.g. 1956 freeze) are captured correctly.
+  var winterCrownKillFactor = crownTempC.subtract(crownKillTotalThreshC)
+    .divide(ee.Number(crownKillSafeThreshC).subtract(crownKillTotalThreshC))
+    .clamp(0, 1)
+    .where(hasWinterCrop.not(), ee.Image.constant(1))
+    .rename('winter_crown_kill_factor');
+  var hardyCrownKillFactor = crownTempC.subtract(hardyCrownKillTotalThreshC)
+    .divide(ee.Number(hardyCrownKillSafeThreshC).subtract(hardyCrownKillTotalThreshC))
+    .clamp(0, 1)
+    .where(hasWinterCrop.not(), ee.Image.constant(1))
+    .rename('hardy_crown_kill_factor');
+  // === FROST YIELD MULTIPLIERS — applied to all GDD paths ===
+  // Spring crops: reproductive frost only (no dormancy phase).
+  // Winter/hardy crops: both crown kill and reproductive frost compound.
+  var finalEffSpring = effectiveGDD.multiply(reproFrostFactor).rename('effective_spring_gdd');
+  var finalEffWinter = effectiveGDD.multiply(hardyReproFrostFactor).multiply(hardyCrownKillFactor).rename('effective_winter_gdd');
+  var finalThermSpring = thermalEffectiveGDD.multiply(reproFrostFactor).rename('thermal_effective_spring_gdd');
+  var finalThermWinter = thermalEffectiveGDD.multiply(hardyReproFrostFactor).multiply(hardyCrownKillFactor).rename('thermal_effective_winter_gdd');
+  var newSpringCat = reproFrostFactor.lte(catastropheThreshold).rename('spring_catastrophe');
+  var newWinterCat = hardyReproFrostFactor.lte(catastropheThreshold)
+    .or(hardyCrownKillFactor.lte(catastropheThreshold))
+    .rename('winter_catastrophe');
+  // === REPRO-STRESS ITERATE — stress-aware GDD cap for spring and winter reproWindow ===
+  // Tracks cumulative moisture/heat stress events during the reproductive window.
+  // When stress days exceed reproStressDaysRequired, GDD stops accumulating — representing
+  // yield loss from sustained stress rather than a single acute event.
+  // _improved and postGreenUpWinter tracks removed (were dead code — never reached outputs).
+  var gddStressList = dailyLike.select(['gdd_sum', 'thermal_gdd_sum', 'stress_days', 'start_doy', 'waterlog_days'])
+    .sort('start_doy').toList(dailyLike.size());
+  var initialState = ee.Dictionary({
+    'cum_spring_gdd_rainfed':         ee.Image.constant(0).rename('cum_spring_gdd_rainfed'),
+    'cum_thermal_spring_gdd_rainfed': ee.Image.constant(0).rename('cum_thermal_spring_gdd_rainfed'),
+    'cum_winter_repro_stress':        ee.Image.constant(0).rename('cum_winter_repro_stress'),
+    'cum_spring_repro_stress':        ee.Image.constant(0).rename('cum_spring_repro_stress'),
+    'cum_waterlog_stress':            ee.Image.constant(0).rename('cum_waterlog_stress')
+  });
+  var reproAccumulated = gddStressList.iterate(function(current, prevState) {
+    current = ee.Image(current);
+    prevState = ee.Dictionary(prevState);
+    var lastSpringGDD_rain    = ee.Image(prevState.get('cum_spring_gdd_rainfed'));
+    var lastThermalSpringGDD  = ee.Image(prevState.get('cum_thermal_spring_gdd_rainfed'));
+    var lastWinterStress      = ee.Image(prevState.get('cum_winter_repro_stress'));
+    var lastSpringStress      = ee.Image(prevState.get('cum_spring_repro_stress'));
+    var lastWaterlogStress    = ee.Image(prevState.get('cum_waterlog_stress'));
+    var doy           = current.select('start_doy');
+    var gddThis       = current.select('gdd_sum');
+    var thermalGddThis = current.select('thermal_gdd_sum');
+    var stressThis    = current.select('stress_days');
+    var waterlogThis  = current.select('waterlog_days');
+    var inSpringPhase = doy.gte(springPhaseStart).and(doy.lte(cropSafeThermalEnd));
+    var inReproWindow = doy.gte(jointingDOY).and(doy.lte(grainFillEndDOY));
+    var winterStressToAdd = stressThis.updateMask(inReproWindow.and(inSpringPhase)).unmask(0);
+    var springStressToAdd = stressThis.updateMask(inReproWindow.and(inSpringPhase)).unmask(0);
+    var waterlogToAdd     = waterlogThis.updateMask(inSpringPhase).unmask(0);
+    var springStressBelowThresh = lastSpringStress.lt(reproStressDaysRequired);
+    return ee.Dictionary({
+      'cum_spring_gdd_rainfed':         lastSpringGDD_rain.add(gddThis.multiply(inSpringPhase).multiply(springStressBelowThresh)),
+      'cum_thermal_spring_gdd_rainfed': lastThermalSpringGDD.add(thermalGddThis.multiply(inSpringPhase).multiply(springStressBelowThresh)),
+      'cum_winter_repro_stress':        lastWinterStress.add(winterStressToAdd),
+      'cum_spring_repro_stress':        lastSpringStress.add(springStressToAdd),
+      'cum_waterlog_stress':            lastWaterlogStress.add(waterlogToAdd)
+    });
+  }, initialState);
+  // === EXTRACT WHEAT REPRO VALUES ===
+  var reproAwareSpringGDD_rain       = ee.Image(ee.Dictionary(reproAccumulated).get('cum_spring_gdd_rainfed')).int().unmask(0);
+  var reproAwareThermalSpringGDD_rain = ee.Image(ee.Dictionary(reproAccumulated).get('cum_thermal_spring_gdd_rainfed')).int().unmask(0);
+  var winterReproStressDays = ee.Image(ee.Dictionary(reproAccumulated).get('cum_winter_repro_stress')).int().unmask(0).rename('winter_repro_stress_days');
+  var springReproStressDays = ee.Image(ee.Dictionary(reproAccumulated).get('cum_spring_repro_stress')).int().unmask(0).rename('spring_repro_stress_days');
+  var waterlogStressDays    = ee.Image(ee.Dictionary(reproAccumulated).get('cum_waterlog_stress')).int().unmask(0).rename('waterlog_stress_days');
+  var springGDD = effectiveGDD.where(springReproStressDays.gte(reproStressDaysRequired), reproAwareSpringGDD_rain)
+    .multiply(reproFrostFactor);
+  var thermalSpringGDD = thermalEffectiveGDD.where(springReproStressDays.gte(reproStressDaysRequired), reproAwareThermalSpringGDD_rain)
+    .multiply(reproFrostFactor).rename('thermal_spring_gdd');
+  var winterGDD = effectiveGDD.multiply(hardyCrownKillFactor).where(invalidWinterSowing, 0).rename('winter_gdd').int().unmask(0);
+  var thermalWinterGDD = thermalEffectiveGDD.multiply(hardyCrownKillFactor).where(invalidWinterSowing, 0).rename('thermal_winter_gdd').int().unmask(0);
+  // === EFFECTIVE GDD (wheat only) ===
+  var effectiveSpringGDD = finalEffSpring;
+  var effectiveWinterGDD = finalEffWinter;
+  var thermalEffectiveSpringGDD = finalThermSpring;
+  var thermalEffectiveWinterGDD = finalThermWinter;
+  var winterCatastrophe = newWinterCat;
+  var springCatastrophe = newSpringCat;
+  // === RAINFALL, SUCCESS, PTQ ===
+  // Winter precip spans a year-crossing window (e.g. DOY 275 → DOY 105 next spring), so the
+  // condition must be OR not AND. Guard with hasWinterCrop so non-crop pixels aren't
+  // filled from the full-year OR, which would include all composites.
+  var winterPrecip = dailyLike.map(function(img) {
+    var doy = img.select('start_doy');
+    // Year-crossing range: OR not AND (e.g. DOY 275 → end of year, then DOY 1 → farmerThermalBegin).
+    var inPhase = doy.gte(winterSowingDOY).or(doy.lte(farmerThermalBegin)).and(hasWinterCrop);
+    return img.select('precip_sum_mm').updateMask(inPhase);
+  }).reduce(ee.Reducer.sum()).rename('winter_precip_mm').unmask(0);
+  var springPrecip = dailyLike.map(function(img) {
+    var inPhase = img.select('start_doy').gte(springPhaseStart).and(img.select('start_doy').lte(effectiveEndDOY));
+    return img.select('precip_sum_mm').updateMask(inPhase);
+  }).reduce(ee.Reducer.sum()).rename('spring_precip_mm').unmask(0);
+  var totalSeasonPrecip = winterPrecip.add(springPrecip).rename('total_season_precip_mm');
+  var autumnWindow = dailyLike.select('viable_days').reduce(ee.Reducer.sum()).rename('autumn_window').int().unmask(0);
+  var baseSuccess = autumnWindow.gte(15)
+    .and(effectiveSpringGDD.gte(springGDDThresh))
+    .and(droughtOutcome.eq(0));
+  // For winter-crop zones, additionally require sufficient GDD for a full winter cycle.
+  // Non-winter-crop zones (excluded from this script, maps to 0) would not reach this branch.
+  var riskAdjustedSuccess = baseSuccess
+    .where(hasWinterCrop, baseSuccess.and(effectiveWinterGDD.gte(winterGDDThresh)))
+    .toByte().rename('risk_adjusted_success');
+  var canIrrigateThermalWinter = thermalEffectiveWinterGDD.gte(winterGDDThresh)
+    .and(hasWinterCrop).and(winterCatastrophe.not()).and(riskAdjustedSuccess.not())
+    .toByte().rename('can_irrigate_thermal_winter');
+  var canIrrigateThermalSpring = thermalEffectiveSpringGDD.gte(springGDDThresh)
+    .and(riskAdjustedSuccess.not()).toByte().rename('can_irrigate_thermal_spring');
+  // Mediterranean zones: spring sowing is not viable (summer drought); output sentinel DOY.
+  var springSowingDOY = springStartPerYear
+    .where(springStartPerYear.eq(0).or(springStartPerYear.gt(cropSafeThermalEnd)), farmerThermalBegin)
+    .where(isMediterraneanZone, cropSafeThermalEnd.add(1))
+    .round().rename('spring_sowing_doy');
+  var springReproWindowStart = jointingDOY;
+  var springReproWindowEnd = headingDOY.min(effectiveEndDOY);
+  var ptqCol = dailyLike.map(function(img) {
+    var doy = img.select('start_doy');
+    var inPTQWindow = doy.gte(springReproWindowStart).and(doy.lte(springReproWindowEnd));
+    var tmean = img.select('temperature_2m').subtract(273.15);
+    var solar = img.select('solar_mj_sum');
+	var ptqDaily = solar.divide(8).divide(tmean.max(0.1)).updateMask(inPTQWindow).rename('ptq_daily');
+    return img.addBands(ptqDaily);
+  });
+  var ptqFactor = ptqCol.select('ptq_daily').mean()
+    .divide(ptqOptimal).clamp(ptqMinFactor, ptqMaxFactor).rename('ptq_factor');
+  var gddSufficiencySpring = effectiveSpringGDD.divide(springGDDThresh).clamp(0, 3);
+  var gddSufficiencyWinter = effectiveWinterGDD.divide(winterGDDThresh).clamp(0, 3);
+  var ptqProductivityIndexSpring = gddSufficiencySpring.multiply(ptqFactor).rename('ptq_productivity_index_spring');
+  var ptqProductivityIndexWinter = gddSufficiencyWinter.multiply(ptqFactor).rename('ptq_productivity_index_winter');
+  var ptqProductivityIndex = ptqProductivityIndexSpring.max(ptqProductivityIndexWinter).rename('ptq_productivity_index');
+  // === FINAL OUTPUT ===
+  return springGDD.addBands([
+    winterGDD, effectiveWinterGDD, effectiveSpringGDD, autumnWindow,
+    reproFrostIndex, hardyReproFrostIndex,
+    reproFrostFactor, hardyReproFrostFactor,
+    winterCrownKillFactor, hardyCrownKillFactor,
+    winterReproStressDays, springReproStressDays, waterlogStressDays,
+    winterCatastrophe, springCatastrophe, riskAdjustedSuccess,
+    winterSowingDOY, springSowingDOY, invalidWinterSowing,
+    hasWinterCrop.rename('has_winter_crop'),
+    hasColdWinter.rename('has_cold_winter'),
+    isMediterraneanZone.rename('is_mediterranean'),
+    meanMinSoilC.rename('mean_min_soil_c'), growingSeasonLength.rename('growing_season_days'),
+    thermalWinterGDD, thermalSpringGDD, thermalEffectiveSpringGDD, thermalEffectiveWinterGDD,
+    winterPrecip, springPrecip, totalSeasonPrecip,
+    canIrrigateThermalWinter, canIrrigateThermalSpring,
+    ptqFactor, ptqProductivityIndex, ptqProductivityIndexSpring, ptqProductivityIndexWinter,
+    jointingDOY, hardyJointingDOY,
+    headingDOY, hardyHeadingDOY,
+    grainFillEndDOY, hardyGrainFillEndDOY
+  ]).updateMask(computeMask).set('year', year);
+};
+// === EXPORT ===
+var yearsList = ee.List.sequence(startYear, endYear);
+var collectionAssetId = 'projects/thermal-growing-seasons/assets/YearlyCropRotationMetrics_1951_1980_North_v110';
+yearsList.evaluate(function(years) {
+  years.forEach(function(y) {
+    var yearStr = ('0000' + y).slice(-4);
+    var img = computeYearMetrics(ee.Number(y));
+    Export.image.toAsset({
+      image: img,
+      description: 'v115_' + yearStr,
+      assetId: collectionAssetId + '/' + yearStr,
+      scale: 11132,
+      region: fullGeometry,
+      crs: 'EPSG:4326',
+      maxPixels: 1e13,
+      pyramidingPolicy: {'.default': 'sample'}
+    });
+  });
+});
+print('✅ v115 complete — rabi removed; Mediterranean zones via hasMildWinterSowable + DOY-175 cap; dual SPEI drought signal; dead code pruned');
+print('Target collection: ' + collectionAssetId);
